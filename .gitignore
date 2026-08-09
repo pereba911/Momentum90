@@ -1,0 +1,14 @@
+# Dependencias
+node_modules/
+
+# Builds
+dist/
+
+# Entorno y secretos (NUNCA subir .env con keys reales)
+.env
+.env.*
+!.env.example
+
+# Sistema
+.DS_Store
+*.log
