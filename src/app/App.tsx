@@ -2299,8 +2299,11 @@ export default function App() {
   return (
     <div className="min-h-screen bg-[#0B0B0E] text-white" style={{ fontFamily: "'Inter', sans-serif" }}>
       {showSettings && (
-        <div className="fixed inset-0 z-[60] bg-black/60 flex justify-end">
-          <div className="flex h-dvh min-h-0 w-full flex-col bg-[#16161F] border-l border-white/10 shadow-2xl sm:w-80">
+        <div className="fixed inset-0 z-[60] bg-black/60 flex justify-end overflow-hidden">
+          <div
+            className="flex min-h-0 w-full flex-col overflow-hidden bg-[#16161F] border-l border-white/10 shadow-2xl sm:w-80"
+            style={{ height: "100vh", height: "100dvh" }}
+          >
             <div className="flex shrink-0 items-center justify-between border-b border-white/5 px-5 py-4">
               <p className="text-white font-bold">Configuración</p>
               <button onClick={() => setShowSettings(false)} className="text-gray-500 hover:text-white" aria-label="Cerrar configuración"><X size={16} /></button>
