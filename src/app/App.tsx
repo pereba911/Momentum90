@@ -2024,20 +2024,46 @@ export default function App() {
       setProfile(null);
       return;
     }
-    api.getProfile(session.access_token)
-      .then((res) => setProfile(res?.profile ?? null))
-      .catch(() => setProfile(null));
+    (async () => {
+      const fresh = await getFreshSession();
+      if (!fresh?.access_token) { setProfile(null); return; }
+      api.getProfile(fresh.access_token)
+        .then((res) => setProfile(res?.profile ?? null))
+        .catch(() => setProfile(null));
+    })();
   }, [session?.user?.id, session?.access_token]);
+
+  // Devuelve una sesión con access token FRESCO: si el token está vencido o a punto
+  // de vencer, espera el refresh de supabase-js ANTES de usarlo. Evita el 401
+  // "Session not found" por token expirado en el arranque (muy común en móvil cuando
+  // la app estuvo en segundo plano y el auto-refresh no había corrido aún).
+  async function getFreshSession() {
+    const { data: { session: cur } } = await supabase.auth.getSession();
+    if (!cur?.access_token) return cur ?? null;
+    const now = Date.now() / 1000;
+    const exp = typeof cur.expires_at === "number" ? cur.expires_at : null;
+    const needsRefresh = !exp || now >= exp - 60; // vencido o a menos de 60 s de vencer
+    if (!needsRefresh) return cur;
+    const { data, error } = await supabase.auth.refreshSession();
+    if (error || !data.session?.access_token) return cur;
+    return data.session;
+  }
 
   // Cargar datos al autenticar desde Supabase como fuente de verdad.
   useEffect(() => {
     if (!session?.user?.id) return;
     let cancelled = false;
 
-    const loadFromSupabase = async () => {
-      const token = session?.access_token;
-      if (!token) return;
-      const uid = session?.user?.id;
+    const loadFromSupabase = async (attempt = 0) => {
+      // Token fresco antes de cargar (evita el 401 por token vencido/revocado).
+      const s = await getFreshSession();
+      const token = s?.access_token;
+      const uid = s?.user?.id;
+      if (!token || !uid) {
+        if (!cancelled) { setLoadState("error"); setLoadError("No hay una sesión válida. Vuelve a iniciar sesión."); }
+        return;
+      }
+      const hadDataBefore = loadedRef.current; // ¿ya teníamos datos cargados en pantalla?
       loadedRef.current = false; // nunca permitir guardar antes de que esta carga termine
       loadingRef.current = true;
       setLoadState("loading");
@@ -2073,15 +2099,39 @@ export default function App() {
           loadedRef.current = true;
           setDirty(false);
           setLoadState("loaded");
+          setSaveError(null);
         }
         console.log(`[LOAD_SUCCESS] user=${uid} tables=app_data+user_entities op=GET → ${Object.keys(mergedEntities).length} entidades`);
         return;
       } catch (e) {
-        // A4: si la carga falla, bloqueamos el auto-guardado y mostramos un error visible.
-        loadedRef.current = false;
+        const isAuth = /401|403|Unauthorized|Session not found|token expired|invalid JWT/i.test(String(e?.message ?? e));
+        // Fallo de autenticación sin reintentar aún → refrescar y reintentar una vez.
+        if (isAuth && attempt === 0 && !cancelled) {
+          console.log(`[LOAD_RETRY] user=${uid} op=GET refresh+retry`);
+          const { data: r, error: rErr } = await supabase.auth.refreshSession();
+          if (!rErr && r.session?.access_token) {
+            await loadFromSupabase(1);
+            return;
+          }
+          // El refresh también falla → sesión muerta: cerrar localmente para mostrar login.
+          console.error(`[LOAD_ERROR] user=${uid} op=GET refresh falló, sesión inválida`);
+          await supabase.auth.signOut().catch(() => {});
+          setSession(null);
+          setLoadState("idle");
+          setLoadError(null);
+          return;
+        }
+        // Fallo definitivo de carga.
         if (!cancelled) {
-          setLoadState("error");
-          setLoadError("No se pudieron cargar tus datos desde la nube. El guardado automático está desactivado. Revisa tu conexión y vuelve a intentarlo.");
+          if (hadDataBefore) {
+            // No tapar datos que ya estaban cargados: mantener la app y avisar.
+            setLoadState("loaded");
+            setSaveError("No se pudieron refrescar tus datos desde la nube. Revisa tu conexión.");
+          } else {
+            // A4: sin datos previos → bloquear el auto-guardado y mostrar error visible.
+            setLoadState("error");
+            setLoadError("No se pudieron cargar tus datos desde la nube. El guardado automático está desactivado. Revisa tu conexión y vuelve a intentarlo.");
+          }
         }
         console.error(`[LOAD_ERROR] user=${uid} table=app_data+user_entities op=GET`, e);
       } finally {
