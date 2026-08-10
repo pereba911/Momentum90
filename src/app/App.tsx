@@ -5,7 +5,7 @@ import {
   CheckCircle2, Circle, Minus, ChevronDown, Settings,
   Building2, Pencil, ChevronLeft, ChevronRight, Star,
   LogOut, Lock, Mail, Eye, EyeOff, Award, Flame, RefreshCw,
-  Wallet, ShieldCheck, Users, Plug
+  Wallet, ShieldCheck, Users, Plug, AlertCircle
 } from "lucide-react";
 import { api, supabase, SUPABASE_CONFIGURED, type AppEntityName, type Asset, type AssetType, type IntegrationConfig } from "../lib/supabase";
 import {
@@ -1975,6 +1975,27 @@ export default function App() {
   const [showSettings, setShowSettings] = useState(false);
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  // ── Sincronización A/B/D: refs espejo para leer valores actuales en timers/callbacks ──
+  const dataRef = useRef(data);
+  const sessionRef = useRef(session);
+  useEffect(() => { dataRef.current = data; }, [data]);
+  useEffect(() => { sessionRef.current = session; }, [session]);
+
+  // Refs de control del flujo de guardado.
+  const loadedRef = useRef(false);        // true SOLO tras un LOAD exitoso
+  const loadingRef = useRef(false);       // hay una carga en curso
+  const savingRef = useRef(false);        // hay un guardado en curso
+  const dirtyRef = useRef(false);         // hay cambios reales del usuario sin guardar
+  const lastSavedRef = useRef<string | null>(null); // snapshot JSON del último estado conocido en la nube
+  const savePromiseRef = useRef<Promise<boolean> | null>(null); // guardado en vuelo (para flush en logout)
+
+  // Estado visible en la UI.
+  const [loadState, setLoadState] = useState<"idle" | "loading" | "loaded" | "error">("idle");
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [dirty, setDirty] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+
   // Auth listener
   useEffect(() => {
     document.documentElement.classList.add("dark");
@@ -2017,7 +2038,10 @@ export default function App() {
       const token = session?.access_token;
       if (!token) return;
       const uid = session?.user?.id;
-      // DIAGNÓSTICO TEMPORAL
+      loadedRef.current = false; // nunca permitir guardar antes de que esta carga termine
+      loadingRef.current = true;
+      setLoadState("loading");
+      setLoadError(null);
       console.log(`[LOAD_START] user=${uid} table=app_data,user_entities op=GET`);
       try {
         const response = await api.getData(token);
@@ -2030,9 +2054,8 @@ export default function App() {
             console.log(`[LOAD_OK user_entities] user=${uid} entity=${entity} op=GET → ${items.length} items`);
             return [key, items] as const;
           } catch (e) {
-            // DIAGNÓSTICO TEMPORAL
             console.error(`[LOAD_ERROR] user=${uid} table=user_entities(${entity}) op=GET`, e);
-            return [key, null] as const;
+            throw e; // cualquier error de carga bloquea el flujo completo (nunca guardar sobre datos inciertos)
           }
         }));
 
@@ -2042,14 +2065,27 @@ export default function App() {
         }, {} as Partial<AppState>);
 
         const rebuiltState = reconcileRemoteState(remoteData, mergedEntities);
-        if (!cancelled) setData(rebuiltState);
-        // DIAGNÓSTICO TEMPORAL
+        if (!cancelled) {
+          // A5: usamos lo que devolvió la nube; NO convertimos un error en INIT vacío.
+          setData(rebuiltState);
+          lastSavedRef.current = JSON.stringify(rebuiltState);
+          dirtyRef.current = false;
+          loadedRef.current = true;
+          setDirty(false);
+          setLoadState("loaded");
+        }
         console.log(`[LOAD_SUCCESS] user=${uid} tables=app_data+user_entities op=GET → ${Object.keys(mergedEntities).length} entidades`);
         return;
       } catch (e) {
-        // La nube debe ser la fuente de verdad; aquí no se usa cache local como fallback.
-        // DIAGNÓSTICO TEMPORAL
-        console.error(`[LOAD_ERROR] user=${uid} table=app_data op=GET`, e);
+        // A4: si la carga falla, bloqueamos el auto-guardado y mostramos un error visible.
+        loadedRef.current = false;
+        if (!cancelled) {
+          setLoadState("error");
+          setLoadError("No se pudieron cargar tus datos desde la nube. El guardado automático está desactivado. Revisa tu conexión y vuelve a intentarlo.");
+        }
+        console.error(`[LOAD_ERROR] user=${uid} table=app_data+user_entities op=GET`, e);
+      } finally {
+        loadingRef.current = false;
       }
     };
 
@@ -2057,42 +2093,89 @@ export default function App() {
     return () => { cancelled = true; };
   }, [session?.user?.id, session?.access_token]);
 
-  // Auto-guardar datos en Supabase cuando hay sesión activa.
-  useEffect(() => {
-    if (!session?.user?.id || !session?.access_token) return;
-    if (saveTimer.current) clearTimeout(saveTimer.current);
-    saveTimer.current = setTimeout(async () => {
-      const uid = session?.user?.id;
-      // DIAGNÓSTICO TEMPORAL
-      console.log(`[SAVE_START] user=${uid} table=app_data+user_entities op=UPSERT(POST)`);
+  // Auto-guardar SOLO tras una carga correcta y SOLO ante cambios reales del usuario (A/B).
+  async function doSave(): Promise<boolean> {
+    const s = sessionRef.current;
+    if (!s?.access_token) return false;
+    if (!loadedRef.current) {
+      console.log(`[SAVE_BLOCKED_NOT_LOADED] user=${s.user?.id} op=UPSERT(POST) skip (LOAD no completado)`);
+      return false;
+    }
+    if (loadingRef.current) {
+      console.log(`[SAVE_BLOCKED_NOT_LOADED] user=${s.user?.id} op=UPSERT(POST) skip (carga pendiente)`);
+      return false;
+    }
+    if (savingRef.current) return false;
+    const snapshot = JSON.stringify(dataRef.current);
+    if (snapshot === lastSavedRef.current) return false; // sin cambios reales
+    savingRef.current = true;
+    setSaving(true);
+    setSaveError(null);
+    const uid = s.user?.id;
+    console.log(`[SAVE_START] user=${uid} table=app_data+user_entities op=UPSERT(POST)`);
+    const run = (async () => {
       try {
-        await api.saveData(session.access_token, data);
-        // Sólo se confirma el guardado tras respuesta exitosa de Supabase.
-        console.log(`[SAVE_SUCCESS] user=${uid} table=app_data op=UPSERT(POST) OK`);
+        await api.saveData(s.access_token, dataRef.current);
         for (const { entity, key } of ENTITY_PERSISTENCE) {
-          const items = data[key] as unknown[] | undefined;
+          const items = dataRef.current[key] as unknown[] | undefined;
           if (!Array.isArray(items)) continue;
-          try {
-            await api.saveEntity(session.access_token, entity, items);
-            console.log(`[SAVE_SUCCESS] user=${uid} table=user_entities(${entity}) op=UPSERT(POST) items=${items.length}`);
-          } catch (e) {
-            // DIAGNÓSTICO TEMPORAL
-            console.error(`[SAVE_ERROR] user=${uid} table=user_entities(${entity}) op=UPSERT(POST)`, e);
-          }
+          await api.saveEntity(s.access_token, entity, items);
         }
+        lastSavedRef.current = snapshot;
+        console.log(`[SAVE_SUCCESS] user=${uid} table=app_data+user_entities op=UPSERT(POST) OK`);
+        return true;
       } catch (e) {
-        // La nube no debe romper la experiencia si falla una sincronización puntual.
-        // DIAGNÓSTICO TEMPORAL
-        console.error(`[SAVE_ERROR] user=${uid} table=app_data op=UPSERT(POST)`, e);
+        console.error(`[SAVE_ERROR] user=${uid} table=app_data+user_entities op=UPSERT(POST)`, e);
+        setSaveError("No se pudo guardar. Revisa tu conexión e inténtalo de nuevo.");
+        return false;
+      } finally {
+        savingRef.current = false;
+        setSaving(false);
+        // Si llegaron cambios durante el guardado, reprogramar; si quedó limpio, apagar dirty.
+        if (loadedRef.current && !loadingRef.current && JSON.stringify(dataRef.current) !== lastSavedRef.current) {
+          dirtyRef.current = true;
+          setDirty(true);
+          scheduleSave();
+        } else if (JSON.stringify(dataRef.current) === lastSavedRef.current) {
+          dirtyRef.current = false;
+          setDirty(false);
+        }
       }
-    }, 1500);
+    })();
+    savePromiseRef.current = run;
+    try {
+      return await run;
+    } finally {
+      savePromiseRef.current = null;
+    }
+  }
+
+  function scheduleSave() {
+    if (saveTimer.current) clearTimeout(saveTimer.current);
+    saveTimer.current = setTimeout(() => { void doSave(); }, 1500);
+  }
+
+  // Detecta cambios reales (diff contra el último estado conocido en la nube) y agenda el guardado.
+  useEffect(() => {
+    if (!loadedRef.current) return;               // A1/A3: nada de guardado antes de LOAD
+    if (loadingRef.current) return;               // no mientras haya carga pendiente
+    const snapshot = JSON.stringify(data);
+    if (snapshot === lastSavedRef.current) {
+      if (dirtyRef.current) { dirtyRef.current = false; setDirty(false); }
+      return;                                     // B2: sin cambios reales → no guardar
+    }
+    dirtyRef.current = true;
+    setDirty(true);
+    if (savingRef.current) return;                // guardado en curso: se reprograma al terminar
+    scheduleSave();                               // B4: debounce de 1500 ms
     return () => { if (saveTimer.current) clearTimeout(saveTimer.current); };
-  }, [data, session?.user?.id, session?.access_token]);
+  }, [data]);
 
   // Migración única: importar datos legacy de localStorage hacia Supabase.
-  // Solo corre si la nube está vacía; NO borra la copia local (fuente queda intacta).
+  // Solo corre DESPUÉS de una carga correcta y solo si la nube está vacía;
+  // NO borra la copia local (fuente queda intacta).
   useEffect(() => {
-    if (!session?.user?.id || !session?.access_token) return;
+    if (!session?.user?.id || !session?.access_token || loadState !== "loaded") return;
     (async () => {
       try {
         const response = await api.getData(session.access_token);
@@ -2115,11 +2198,48 @@ export default function App() {
         // Migración best-effort: nunca debe romper el login ni la carga normal.
       }
     })();
-  }, [session?.user?.id, session?.access_token]);
+  }, [session?.user?.id, session?.access_token, loadState]);
 
+  // Logout seguro (D): hace flush del guardado pendiente y no cierra sesión
+  // silenciosamente si hay cambios sin sincronizar.
   const handleLogout = async () => {
+    const s = sessionRef.current;
+    const hasPending = loadedRef.current && !!s?.access_token &&
+      JSON.stringify(dataRef.current) !== lastSavedRef.current;
+    const inFlight = savingRef.current;
+
+    if (hasPending || inFlight) {
+      console.log("[LOGOUT_FLUSH_START]");
+      try {
+        // Esperar el guardado en vuelo si lo hay.
+        if (savingRef.current && savePromiseRef.current) {
+          await savePromiseRef.current;
+        }
+        // Guardar inmediatamente lo que haya quedado pendiente (sin debounce).
+        if (loadedRef.current && JSON.stringify(dataRef.current) !== lastSavedRef.current) {
+          const ok = await doSave();
+          if (!ok) throw new Error("flush save failed");
+        }
+        console.log("[LOGOUT_FLUSH_SUCCESS]");
+      } catch (e) {
+        console.error("[LOGOUT_FLUSH_ERROR]", e);
+        setSaveError("Hay cambios sin guardar y no se pudo sincronizar antes de cerrar sesión. Inténtalo de nuevo.");
+        return; // D4: no cerrar sesión silenciosamente con cambios pendientes.
+      }
+    }
+
+    if (saveTimer.current) { clearTimeout(saveTimer.current); saveTimer.current = null; }
     await supabase.auth.signOut();
-    setSession(null); setData(INIT);
+    setSession(null);
+    setData(INIT);
+    // Reset del estado de sincronización.
+    loadedRef.current = false;
+    dirtyRef.current = false;
+    lastSavedRef.current = null;
+    setDirty(false);
+    setLoadState("idle");
+    setLoadError(null);
+    setSaveError(null);
   };
 
   // Pantalla de carga
@@ -2142,6 +2262,22 @@ export default function App() {
 
   // Pantalla de login/registro
   if (!session) return <AuthScreen />;
+
+  // Si la carga falló: bloqueamos el uso y mostramos el error. Nunca guardamos
+  // (loadedRef=false) y nunca reemplazamos datos existentes con INIT vacío.
+  if (loadState === "error") {
+    return (
+      <div className="min-h-screen bg-[#0B0B0E] text-white flex items-center justify-center px-6" style={{ fontFamily: "'Inter',sans-serif" }}>
+        <div className="max-w-md w-full text-center space-y-4">
+          <div className="w-12 h-12 rounded-xl bg-red-500/15 border border-red-500/25 flex items-center justify-center mx-auto"><AlertCircle size={22} className="text-red-400" /></div>
+          <p className="text-white font-semibold text-lg">No se pudieron cargar tus datos</p>
+          <p className="text-gray-500 text-sm">{loadError ?? "Ocurrió un error al conectar con Supabase."}</p>
+          <p className="text-xs text-gray-600">El guardado automático está desactivado para evitar sobrescribir tus datos.</p>
+          <button onClick={() => window.location.reload()} className="mt-2 rounded-xl bg-[#9D4EDD] hover:bg-[#7B2CBF] text-white text-sm font-semibold px-5 py-2.5 transition-all">Reintentar</button>
+        </div>
+      </div>
+    );
+  }
 
 
   const keyDone = data.tasks.filter(t => t.isKey && t.completed).length;
@@ -2207,6 +2343,7 @@ export default function App() {
               <p className="text-xs text-gray-600">{new Date().toLocaleDateString("es-MX", { weekday: "long", year: "numeric", month: "long", day: "numeric" })}</p>
             </div>
             <div className="flex items-center gap-2">
+              {saving && <span className="hidden md:inline-flex items-center gap-1.5 text-[11px] text-gray-500"><RefreshCw size={12} className="animate-spin" /> Guardando…</span>}
               <div className="hidden md:flex items-center gap-1.5 bg-[#9D4EDD]/10 border border-[#9D4EDD]/20 px-3 py-1.5 rounded-xl">
                 <span className="text-[#c084fc] text-xs font-semibold font-mono">Q{getQ()} · Día {dayOfQNow()}/{getQTotalDays(getQ(), getQYear())}</span>
               </div>
@@ -2216,6 +2353,15 @@ export default function App() {
         </header>
 
         <main className="max-w-6xl mx-auto px-4 md:px-5 py-6 pb-28 lg:pb-8">
+          {saveError && (
+            <div className="mb-4 flex items-start justify-between gap-3 rounded-xl border border-red-500/25 bg-red-500/10 px-4 py-3 text-sm text-red-300">
+              <div className="flex items-start gap-2">
+                <AlertCircle size={16} className="mt-0.5 shrink-0" />
+                <span>{saveError}</span>
+              </div>
+              <button onClick={() => setSaveError(null)} className="text-red-400/70 hover:text-red-300 shrink-0" aria-label="Cerrar aviso"><X size={15} /></button>
+            </div>
+          )}
           {tab === "dashboard" && <DashboardTab s={data} set={setData} />}
           {tab === "money" && <MoneyTab s={data} set={setData} />}
           {tab === "capital" && <CapitalTab s={data} set={setData} />}
