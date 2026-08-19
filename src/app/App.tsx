@@ -5,9 +5,9 @@ import {
   CheckCircle2, Circle, Minus, ChevronDown, Settings,
   Building2, Pencil, ChevronLeft, ChevronRight, Star,
   LogOut, Lock, Mail, Eye, EyeOff, Award, Flame, RefreshCw,
-  Wallet, ShieldCheck, Users, Plug, AlertCircle
+  Wallet, ShieldCheck, Users, Plug, AlertCircle, Info
 } from "lucide-react";
-import { api, supabase, SUPABASE_CONFIGURED, type AppEntityName, type Asset, type AssetType, type IntegrationConfig } from "../lib/supabase";
+import { api, supabase, SUPABASE_CONFIGURED, DEFAULT_SETTINGS, type AppEntityName, type Asset, type AssetType, type IntegrationConfig } from "../lib/supabase";
 import {
   AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer,
   RadarChart, Radar, PolarGrid, PolarAngleAxis,
@@ -132,7 +132,21 @@ const PIE_COLORS = ["#9D4EDD", "#3B82F6", "#10B981", "#F59E0B", "#EF4444", "#EC4
 
 function uid() { return Math.random().toString(36).slice(2, 9); }
 function today() { return new Date().toISOString().split("T")[0]; }
-function fmt(n: number, c: Currency = "MXN"): string { const s: Record<Currency, string> = { MXN: "$", USD: "US$", EUR: "€" }; const v = Math.round(n); if (v >= 1e6) return `${s[c]}${(v / 1e6).toFixed(1)}M`; if (v >= 1000) return `${s[c]}${(v / 1000).toFixed(0)}K`; return `${s[c]}${v.toLocaleString("es-MX")}`; }
+// Fecha LOCAL del usuario (YYYY-MM-DD), no UTC.
+function todayLocal(): string {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+// Tareas clave completadas HOY (día local). completedAt se guarda con todayLocal()
+// (día local, no UTC), por lo que se compara directamente; nunca borra historial.
+function countKeyTasksDoneToday(tasks: Task[]): number {
+  const t = todayLocal();
+  return tasks.filter(x => x.isKey && x.completed && x.completedAt === t).length;
+}
+// Preferencia visual global de ocultar montos (fuera de AppState → no dispara autosave).
+let hideAmountsGlobal = false;
+function setHideAmountsGlobal(v: boolean) { hideAmountsGlobal = v; }
+function fmt(n: number, c: Currency = "MXN"): string { const s: Record<Currency, string> = { MXN: "$", USD: "US$", EUR: "€" }; if (hideAmountsGlobal) return `${s[c]} ••••••`; const v = Math.round(n); if (v >= 1e6) return `${s[c]}${(v / 1e6).toFixed(1)}M`; if (v >= 1000) return `${s[c]}${(v / 1000).toFixed(0)}K`; return `${s[c]}${v.toLocaleString("es-MX")}`; }
 function pct(v: number, t: number): number { return t === 0 ? 0 : Math.min(100, Math.round((v / t) * 100)); }
 function getQ(d = new Date()): number { return Math.floor(d.getMonth() / 3) + 1; }
 function getQYear(d = new Date()): number { return d.getFullYear(); }
@@ -183,6 +197,133 @@ function genPlanWeeks(): PlanWeek[] { return Array.from({ length: 12 }, (_, i) =
 function getMonthlyBurn(s: AppState): number {
   const recurring = (s.recurringExpenses || []).filter(r => r.active).reduce((a, r) => a + r.amount, 0);
   return s.monthlyFixedExpense || s.finance.monthlyExpense || recurring;
+}
+
+// ── Efectivo disponible (Objetivo 1) ──────────────────────────────────────────
+// "Efectivo disponible HOY" = saldo líquido tal como está representado en los datos
+// (finance.cash ya refleja pagos realizados; NO se restan de nuevo gastos históricos).
+function liquidCashToday(s: AppState): number { return s.finance.cash ?? 0; }
+
+// Mes calendario LOCAL actual → periodo de proyección.
+function currentMonthBounds(): { start: string; end: string; label: string } {
+  const n = new Date();
+  const y = n.getFullYear(); const m = n.getMonth();
+  const first = new Date(y, m, 1);
+  const last = new Date(y, m + 1, 0);
+  const pad = (x: number) => String(x).padStart(2, "0");
+  return {
+    start: `${y}-${pad(m + 1)}-01`,
+    end: `${y}-${pad(m + 1)}-${pad(last.getDate())}`,
+    label: first.toLocaleDateString("es-MX", { month: "long", year: "numeric" }),
+  };
+}
+function inDateRange(dateStr: string, start: string, end: string): boolean { return dateStr >= start && dateStr <= end; }
+// Gastos fijos mensuales (configurado o recurrentes activos). Reutiliza getMonthlyBurn.
+function fixedMonthlyAmount(s: AppState): number { return getMonthlyBurn(s); }
+// Gastos fijos YA pagados dentro del periodo → se excluyen de "pendientes" (sin doble descuento).
+function fixedPaidInPeriod(s: AppState, start: string, end: string): number {
+  const recurringDescs = new Set(s.recurringExpenses.map(r => r.description));
+  return s.expenses
+    .filter(e => inDateRange(e.date, start, end) && (e.recurring || recurringDescs.has(e.description)))
+    .reduce((a, e) => a + e.amount, 0);
+}
+// Gastos variables con fecha FUTURA dentro del periodo (previstos). Modelo actual: no hay
+// campo "previsto" explícito; se usan los registrados con fecha > hoy (heurística documentada).
+function variablePlannedInPeriod(s: AppState, start: string, end: string): number {
+  const t = todayLocal();
+  const recurringDescs = new Set(s.recurringExpenses.map(r => r.description));
+  return s.expenses
+    .filter(e => inDateRange(e.date, start, end) && e.date > t && !(e.recurring || recurringDescs.has(e.description)))
+    .reduce((a, e) => a + e.amount, 0);
+}
+// Ingresos futuros confirmados o esperados del periodo (status != collected).
+function expectedIncomeInPeriod(s: AppState, start: string, end: string): number {
+  return s.incomes
+    .filter(i => i.status !== "collected" && inDateRange(i.date, start, end))
+    .reduce((a, i) => a + i.amount, 0);
+}
+function projectedCash(s: AppState): { value: number; start: string; end: string; label: string } {
+  const { start, end, label } = currentMonthBounds();
+  const fixed = fixedMonthlyAmount(s);
+  const fixedPaid = fixedPaidInPeriod(s, start, end);
+  const fixedPending = Math.max(0, fixed - fixedPaid);
+  const variable = variablePlannedInPeriod(s, start, end);
+  const inc = expectedIncomeInPeriod(s, start, end);
+  const value = liquidCashToday(s) + inc - fixedPending - variable;
+  return { value, start, end, label };
+}
+
+// ── Estrés financiero (Objetivo 5) ────────────────────────────────────────────
+function clamp(v: number, lo: number, hi: number): number { return Math.min(hi, Math.max(lo, v)); }
+function goalDeadline(g: Goal): { start: Date; end: Date } | null {
+  const y = getQYear();
+  if (g.type === "quarterly") { const q = g.quarter ?? getQ(); const start = qStartDate(q, y); return { start, end: new Date(start.getFullYear(), start.getMonth() + 3, 0) }; }
+  if (g.type === "annual") return { start: new Date(y, 0, 1), end: new Date(y, 11, 31) };
+  return null;
+}
+function daysBetween(a: Date, b: Date): number { return Math.floor((b.getTime() - a.getTime()) / 86400000); }
+// Fórmula aprobada:  retraso_i = clamp((avanceEsperado_i - avanceActual_i) / max(objetivo_i,1), 0, 1)
+//                    estrés   = round(clamp(1 + 9 * promedioPonderado(retraso_i), 1, 10))
+// Peso proporcional al monto objetivo. Sin fecha límite → avance esperado de referencia = 50% (documentado).
+function financialStress(s: AppState): { value: number | null; reason: "ok" | "no-goals" } {
+  const moneyGoals = s.goals.filter(g => g.kind === "money" && g.targetAmount && g.targetAmount > 0 && Number.isFinite(g.currentAmount));
+  if (moneyGoals.length === 0) return { value: null, reason: "no-goals" };
+  const now = new Date();
+  let weighted = 0; let totalW = 0;
+  for (const g of moneyGoals) {
+    const target = g.targetAmount!;
+    const current = g.currentAmount ?? 0;
+    const dl = goalDeadline(g);
+    let avanceEsperado = 0;
+    if (dl) {
+      const totalDays = Math.max(1, daysBetween(dl.start, dl.end) + 1);
+      const elapsedDays = clamp(daysBetween(dl.start, now) + 1, 0, totalDays);
+      avanceEsperado = target * (elapsedDays / totalDays);
+    } else {
+      avanceEsperado = target * 0.5;
+    }
+    const retraso = clamp((avanceEsperado - current) / Math.max(target, 1), 0, 1);
+    weighted += retraso * target;
+    totalW += target;
+  }
+  const avg = totalW > 0 ? weighted / totalW : 0;
+  return { value: Math.round(clamp(1 + 9 * avg, 1, 10)), reason: "ok" };
+}
+function stressInterpretation(v: number): string {
+  if (v <= 3) return "Ritmo por delante: tus metas van al ritmo o adelantadas.";
+  if (v <= 6) return "Ritmo moderado: algunas metas van algo por debajo del ritmo esperado.";
+  return "Ritmo atrasado: tus metas van por debajo del ritmo necesario. Revisa el plan de metas.";
+}
+
+// ── Hábitos: puntaje semanal y trimestral (Objetivo 4) ───────────────────────
+function habitMaxScore(h: HabitConfig): number { return h.tiers.length ? h.tiers[h.tiers.length - 1].score : 0; }
+function habitWeekPoints(s: AppState, monday: Date): { x: number; y: number } {
+  const active = s.habitConfigs.filter(h => h.active);
+  const x = active.reduce((a, h) => a + getHabitScore(h, getHabitWeeklyTotal(s.habitLogs, h.id, monday)).score, 0);
+  const y = active.reduce((a, h) => a + habitMaxScore(h), 0);
+  return { x, y };
+}
+function habitQuarter(s: AppState): { x: number; y: number; byCat: Record<string, { x: number; y: number }>; pct: number } {
+  const now = new Date(); const q = getQ(now); const yr = getQYear(now);
+  const qs = qStartDate(q, yr);
+  const qe = new Date(qs.getFullYear(), qs.getMonth() + 3, 0);
+  const firstMonday = new Date(qs); const dow = firstMonday.getDay(); firstMonday.setDate(firstMonday.getDate() - ((dow === 0 ? 7 : dow) - 1));
+  let x = 0; let y = 0;
+  const byCat: Record<string, { x: number; y: number }> = { salud: { x: 0, y: 0 }, enfoque: { x: 0, y: 0 }, negocio: { x: 0, y: 0 } };
+  for (const m = new Date(firstMonday); m <= qe; m.setDate(m.getDate() + 7)) {
+    if (m > now) break;
+    const active = s.habitConfigs.filter(h => h.active);
+    for (const h of active) {
+      const wTot = getHabitWeeklyTotal(s.habitLogs, h.id, m);
+      const sc = getHabitScore(h, wTot).score;
+      const mx = habitMaxScore(h);
+      x += sc; y += mx;
+      const cat = h.category || "negocio";
+      const c = byCat[cat] || { x: 0, y: 0 };
+      c.x += sc; c.y += mx; byCat[cat] = c;
+    }
+  }
+  return { x, y, byCat, pct: y > 0 ? Math.round((x / y) * 100) : 0 };
 }
 
 function mergeSavedState(parsed: Partial<AppState>): AppState {
@@ -244,6 +385,14 @@ function BarFill({ value, max, color = "#9D4EDD", h = 6 }: { value: number; max:
 type BColor = "green" | "yellow" | "red" | "purple" | "blue" | "gray" | "orange";
 const BCLS: Record<BColor, string> = { green: "bg-emerald-500/10 text-emerald-400 border-emerald-500/25", yellow: "bg-amber-500/10 text-amber-400 border-amber-500/25", red: "bg-red-500/10 text-red-400 border-red-500/25", purple: "bg-purple-500/10 text-[#c084fc] border-purple-500/25", blue: "bg-blue-500/10 text-blue-400 border-blue-500/25", gray: "bg-white/5 text-gray-400 border-white/10", orange: "bg-orange-500/10 text-orange-400 border-orange-500/25" };
 function Bdg({ children, color }: { children: ReactNode; color: BColor }) { return <span className={`text-[11px] px-2 py-0.5 rounded-full border font-medium ${BCLS[color]}`}>{children}</span>; }
+function EyeToggle({ hidden, onToggle, label = "Mostrar u ocultar montos" }: { hidden: boolean; onToggle: () => void; label?: string }) {
+  return (
+    <button onClick={onToggle} aria-label={label} aria-pressed={hidden} title={label}
+      className="w-11 h-11 shrink-0 inline-flex items-center justify-center rounded-xl text-gray-400 hover:text-white hover:bg-white/10 transition-all">
+      {hidden ? <EyeOff size={16} /> : <Eye size={16} />}
+    </button>
+  );
+}
 function Inp({ label, value, onChange, type = "text", placeholder = "", full = false }: { label: string; value: string; onChange: (v: string) => void; type?: string; placeholder?: string; full?: boolean }) { return (<div className={full ? "col-span-2" : ""}><label className="text-xs text-gray-500 mb-1.5 block">{label}</label><input type={type} value={value} onChange={e => onChange(e.target.value)} placeholder={placeholder} className="w-full bg-[#0D0D12] border border-white/10 text-white rounded-xl px-3 py-2.5 text-sm placeholder-gray-700 focus:outline-none focus:border-[#9D4EDD]/60" /></div>); }
 
 // ─── Auth Screen (Supabase real — login + registro + recuperación) ───────────
@@ -483,6 +632,11 @@ function HabitTracker({ s, set }: { s: AppState; set: (x: AppState) => void }) {
   const mPct = pct(calcMonthlyCollected(s.incomes), s.monthlyGoal.target);
   const scores = calcAutoScores(s.habitConfigs, s.habitLogs, refMonday, mPct);
   const overall = Math.round((scores.salud + scores.enfoque + scores.negocio + scores.dinero) / 4);
+  const weekPts = habitWeekPoints(s, refMonday);
+  const qtr = habitQuarter(s);
+  const catLabels: Record<string, string> = { salud: "Salud", enfoque: "Enfoque", negocio: "Negocio" };
+  const catEntries = (Object.entries(qtr.byCat) as [string, { x: number; y: number }][]).filter(([, v]) => v.y > 0);
+  const worstCat = catEntries.length ? catEntries.reduce((min, cur) => (cur[1].x / cur[1].y) < (min[1].x / min[1].y) ? cur : min) : null;
   const sunday = isSunday() && weekOffset === 0;
   const catColors: Record<HabitCategory, string> = { salud: "#10B981", negocio: "#9D4EDD", enfoque: "#3B82F6" };
 
@@ -520,6 +674,23 @@ function HabitTracker({ s, set }: { s: AppState; set: (x: AppState) => void }) {
           <div><p className="text-xs font-semibold text-white">Score CEO · {fmtShort(refMonday)} – {fmtShort(days[6])}</p><p className="text-[11px] text-gray-500 mt-0.5">{sunday ? "✅ Score final — semana completada" : weekOffset === 0 ? `En curso · ${7 - new Date().getDay() || 7} días para cierre dominical` : "Semana pasada"}</p></div>
           <div className="text-right"><p className={`text-4xl font-black ${sunday ? "text-emerald-400" : "text-[#c084fc]"}`}>{overall > 0 ? overall : "—"}</p><p className="text-[10px] text-gray-600">{sunday ? "Final ✓" : "Pendiente…"}</p></div>
         </div>
+        <div className="mt-3 p-3.5 rounded-xl border border-white/5 bg-[#0D0D12] flex items-center justify-between">
+          <div><p className="text-xs font-semibold text-white">Puntaje semanal</p><p className="text-[11px] text-gray-500 mt-0.5">Puntos obtenidos / máximo posible de la semana (config actual de hábitos)</p></div>
+          <div className="text-right"><p className="text-3xl font-black text-[#c084fc]">{weekPts.x} <span className="text-base text-gray-500">/ {weekPts.y} pts</span></p><p className="text-[10px] text-gray-600">{weekPts.y > 0 ? Math.round((weekPts.x / weekPts.y) * 100) : 0}% del máximo semanal</p></div>
+        </div>
+        <div className="mt-3 rounded-xl border border-white/5 bg-[#0D0D12] p-3.5">
+          <div className="flex items-center justify-between mb-2"><p className="text-xs font-semibold text-white uppercase tracking-wider">Calificación trimestral</p><Bdg color={qtr.pct >= 70 ? "green" : qtr.pct >= 40 ? "yellow" : "red"}>{qtr.pct}%</Bdg></div>
+          <p className="text-[11px] text-gray-500">Puntaje total del trimestre actual: <span className="text-[#c084fc] font-bold">{qtr.x}</span> / <span className="text-gray-300 font-bold">{qtr.y}</span> pts. Estimación basada en registros existentes y configuración actual de hábitos.</p>
+          <div className="grid grid-cols-3 gap-2 mt-3">
+            {(["salud", "enfoque", "negocio"] as const).map(cat => {
+              const v = qtr.byCat[cat] || { x: 0, y: 0 };
+              const p = v.y > 0 ? Math.round((v.x / v.y) * 100) : 0;
+              return (<div key={cat} className="rounded-xl bg-[#16161F] border border-white/5 p-2.5 text-center"><p className="text-[11px] text-gray-400">{catLabels[cat]}</p><p className="text-sm font-bold text-white mt-0.5">{v.x}<span className="text-gray-500 text-[10px]"> / {v.y}</span></p><p className={`text-[10px] font-semibold ${p >= 70 ? "text-emerald-400" : p >= 40 ? "text-amber-400" : "text-red-400"}`}>{p}%</p></div>);
+            })}
+          </div>
+          {worstCat && <p className="text-[11px] text-gray-500 mt-3">Área con mayor oportunidad de mejora: <span className="text-gray-300 font-medium">{catLabels[worstCat[0]]}</span> ({Math.round((worstCat[1].x / worstCat[1].y) * 100)}%)</p>}
+          {qtr.y === 0 && <p className="text-[11px] text-gray-600 mt-2 italic">Sin registros suficientes para calcular el trimestre (estimación parcial).</p>}
+        </div>
       </Card>
     </>
   );
@@ -527,7 +698,7 @@ function HabitTracker({ s, set }: { s: AppState; set: (x: AppState) => void }) {
 
 // ─── Dashboard Tab ────────────────────────────────────────────────────────────
 
-function DashboardTab({ s, set }: { s: AppState; set: (x: AppState) => void }) {
+function DashboardTab({ s, set, hideAmounts, onToggleHide }: { s: AppState; set: (x: AppState) => void; hideAmounts: boolean; onToggleHide: () => void }) {
   const c = s.currency; const q = getQ(); const qYear = getQYear();
   const qs = qStartDate(q, qYear); const qTotal = getQTotalDays(q, qYear);
   const dInQ = dayOfQNow(); const wIdx = curWeekIndex(qs);
@@ -538,6 +709,10 @@ function DashboardTab({ s, set }: { s: AppState; set: (x: AppState) => void }) {
   const pipeline = s.incomes.filter(i => i.status !== "collected").reduce((a, i) => a + i.amount, 0);
   const crmPipeline = (s.businesses || []).filter(b => b.status !== "idea" && b.status !== "ventas").reduce((a, b) => a + b.value, 0);
   const [newStress, setNewStress] = useState("");
+  const [showStressInfo, setShowStressInfo] = useState(false);
+  const proj = projectedCash(s);
+  const stress = financialStress(s);
+  const stressColor = stress.value == null ? "#6b7280" : stress.value <= 3 ? "#10B981" : stress.value <= 6 ? "#F59E0B" : "#EF4444";
 
   return (
     <div className="space-y-5">
@@ -553,15 +728,16 @@ function DashboardTab({ s, set }: { s: AppState; set: (x: AppState) => void }) {
       {/* KPIs */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
         {[
-          { label: "Efectivo Disponible", val: fmt(s.finance.cash, c), sub: "Hoy", emoji: "💰", accent: "#10B981", trend: "up" as const },
-          { label: "Por Cobrar", val: fmt(s.finance.receivable, c), sub: "Pendiente", emoji: "⏳", accent: "#F59E0B", trend: "flat" as const },
-          { label: "Deuda Total", val: fmt(s.finance.totalDebt, c), sub: `${s.debts.length} cuentas`, emoji: "💳", accent: "#EF4444", trend: "down" as const },
-          { label: "Colchón Financiero", val: `${cushion.toFixed(1)} meses`, sub: "Meta: 3 meses", emoji: "🛟", accent: cushion >= 3 ? "#10B981" : cushion >= 1 ? "#F59E0B" : "#EF4444" },
-        ].map(({ label, val, sub, emoji, accent, trend }) => (
+          { label: "Efectivo Disponible", val: fmt(s.finance.cash, c), sub: "Hoy", emoji: "💰", accent: "#10B981", trend: "up" as const, tip: "Saldo líquido actual (cash) tal como está representado" },
+          { label: "Efectivo Proyectado", val: fmt(proj.value, c), sub: proj.label, emoji: "📈", accent: "#3B82F6", trend: "flat" as const, tip: `Proyección ${proj.start} → ${proj.end}: cash + ingresos esperados − fijos pendientes − variables previstos` },
+          { label: "Por Cobrar", val: fmt(s.finance.receivable, c), sub: "Pendiente", emoji: "⏳", accent: "#F59E0B", trend: "flat" as const, tip: "Cuentas por cobrar" },
+          { label: "Deuda Total", val: fmt(s.finance.totalDebt, c), sub: `${s.debts.length} cuentas`, emoji: "💳", accent: "#EF4444", trend: "down" as const, tip: "Deuda total registrada" },
+          { label: "Colchón Financiero", val: `${cushion.toFixed(1)} meses`, sub: "Meta: 3 meses", emoji: "🛟", accent: cushion >= 3 ? "#10B981" : cushion >= 1 ? "#F59E0B" : "#EF4444", trend: undefined, tip: "Meses de cobertura = efectivo ÷ gasto mensual fijo" },
+        ].map(({ label, val, sub, emoji, accent, trend, tip }) => (
           <Card key={label} className="relative overflow-hidden group hover:border-white/10 transition-all">
-            <div className="flex items-start justify-between mb-4"><div className="w-10 h-10 rounded-xl flex items-center justify-center text-xl" style={{ background: `${accent}18` }}>{emoji}</div>{trend && <div className={`flex items-center gap-1 text-xs font-medium px-2 py-1 rounded-lg ${trend === "up" ? "text-emerald-400 bg-emerald-400/10" : trend === "down" ? "text-red-400 bg-red-400/10" : "text-gray-400 bg-white/5"}`}>{trend === "up" ? <TrendingUp size={12} /> : trend === "down" ? <TrendingDown size={12} /> : <Minus size={12} />}</div>}</div>
+            <div className="flex items-start justify-between mb-4"><div className="w-10 h-10 rounded-xl flex items-center justify-center text-xl" style={{ background: `${accent}18` }}>{emoji}</div><div className="flex items-center gap-1">{trend && <div className={`flex items-center gap-1 text-xs font-medium px-2 py-1 rounded-lg ${trend === "up" ? "text-emerald-400 bg-emerald-400/10" : trend === "down" ? "text-red-400 bg-red-400/10" : "text-gray-400 bg-white/5"}`}>{trend === "up" ? <TrendingUp size={12} /> : trend === "down" ? <TrendingDown size={12} /> : <Minus size={12} />}</div>}<EyeToggle hidden={hideAmounts} onToggle={onToggleHide} label={label === "Colchón Financiero" ? "Mostrar u ocultar montos del dashboard" : `Mostrar u ocultar ${label}`} /></div></div>
             <p className="text-xs text-gray-500 mb-1 uppercase tracking-wider">{label}</p>
-            <p className="text-2xl font-bold text-white leading-none">{val}</p>
+            <p className="text-2xl font-bold text-white leading-none" title={tip}>{val}</p>
             <p className="text-xs mt-1.5" style={{ color: accent }}>{sub}</p>
             <div className="absolute bottom-0 left-0 right-0 h-[2px] opacity-0 group-hover:opacity-60 transition-opacity" style={{ background: accent }} />
           </Card>
@@ -600,8 +776,28 @@ function DashboardTab({ s, set }: { s: AppState; set: (x: AppState) => void }) {
       {/* Stress + Goals */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
         <Card>
-          <div className="flex items-center justify-between mb-2"><p className="text-xs text-gray-500 uppercase tracking-wider">Estrés Financiero</p><span className="text-2xl font-black" style={{ color: (s.stressEntries[s.stressEntries.length - 1]?.level ?? 0) <= 3 ? "#10B981" : (s.stressEntries[s.stressEntries.length - 1]?.level ?? 0) <= 6 ? "#F59E0B" : "#EF4444" }}>{s.stressEntries[s.stressEntries.length - 1]?.level ?? 0}/10</span></div>
-          <div className="h-20"><ResponsiveContainer width="100%" height="100%"><AreaChart data={s.stressEntries}><defs><linearGradient id="sg" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="#EF4444" stopOpacity={0.3} /><stop offset="100%" stopColor="#EF4444" stopOpacity={0} /></linearGradient></defs><Area type="monotone" dataKey="level" stroke="#EF4444" fill="url(#sg)" strokeWidth={2} dot={false} /><Tooltip contentStyle={{ background: "#16161F", border: "1px solid rgba(255,255,255,0.08)", borderRadius: 10, fontSize: 11, color: "#fff" }} /></AreaChart></ResponsiveContainer></div>
+          <div className="flex items-center justify-between mb-2">
+            <div className="flex items-center gap-1"><p className="text-xs text-gray-500 uppercase tracking-wider">Estrés Financiero</p><button onClick={() => setShowStressInfo(!showStressInfo)} aria-label="Explicar cómo se calcula el estrés" title="¿Cómo se calcula?" className="w-9 h-9 inline-flex items-center justify-center rounded-xl text-gray-500 hover:text-[#c084fc] hover:bg-white/5"><Info size={14} /></button></div>
+            <span className="text-2xl font-black" style={{ color: stressColor }}>{stress.value == null ? "—" : `${stress.value}/10`}</span>
+          </div>
+          {stress.value == null ? (
+            <p className="text-sm text-gray-500 py-3">Aún no hay suficientes metas monetarias para calcular el estrés financiero.</p>
+          ) : (
+            <div className="space-y-2">
+              <BarFill value={stress.value} max={10} color={stressColor} h={8} />
+              <p className="text-[11px] text-gray-500">{stressInterpretation(stress.value)}</p>
+            </div>
+          )}
+          {showStressInfo && (
+            <div className="mt-3 p-3 rounded-xl bg-[#0D0D12] border border-white/10 text-[11px] text-gray-400 space-y-1.5">
+              <p className="font-semibold text-gray-300">¿Cómo se calcula? (escala 1 a 10)</p>
+              <p>Por cada meta monetaria: <span className="text-gray-200">retraso = (avance esperado − avance actual) ÷ meta</span>, acotado a [0,1]. El avance esperado se mide por tiempo transcurrido del período (trimestre/año); sin fecha límite se usa 50% como referencia.</p>
+              <p>Estrés = <span className="text-gray-200">1 + 9 × promedio ponderado</span> (peso = monto de la meta), redondeado y acotado a 1–10.</p>
+              <p>Al ritmo → ≈5 · Atrasada → 6–10 · Adelantada → 1–4. Indicador de ritmo de metas; <span className="text-gray-300">no es un diagnóstico médico ni psicológico</span>.</p>
+            </div>
+          )}
+          <div className="h-20 mt-2"><ResponsiveContainer width="100%" height="100%"><AreaChart data={s.stressEntries}><defs><linearGradient id="sg" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="#EF4444" stopOpacity={0.3} /><stop offset="100%" stopColor="#EF4444" stopOpacity={0} /></linearGradient></defs><Area type="monotone" dataKey="level" stroke="#EF4444" fill="url(#sg)" strokeWidth={2} dot={false} /><Tooltip contentStyle={{ background: "#16161F", border: "1px solid rgba(255,255,255,0.08)", borderRadius: 10, fontSize: 11, color: "#fff" }} /></AreaChart></ResponsiveContainer></div>
+          <p className="text-[10px] text-gray-600 mt-1">Historial manual (registrado por ti)</p>
           <div className="flex gap-2 mt-2"><input type="number" min="1" max="10" value={newStress} onChange={e => setNewStress(e.target.value)} placeholder="1–10" className="flex-1 bg-[#0D0D12] border border-white/10 text-white rounded-xl px-3 py-1.5 text-xs placeholder-gray-700 focus:outline-none focus:border-[#9D4EDD]/50" /><button onClick={() => { if (!newStress) return; const d = new Date().toLocaleDateString("es-MX", { month: "short", day: "numeric" }); set({ ...s, stressEntries: [...s.stressEntries.slice(-29), { date: d, level: Number(newStress) }] }); setNewStress(""); }} className="px-3 py-1.5 bg-[#9D4EDD]/20 text-[#c084fc] rounded-xl text-xs hover:bg-[#9D4EDD]/30">Registrar</button></div>
         </Card>
         <Card className="lg:col-span-2">
@@ -1068,7 +1264,7 @@ function LogrosTab({ s, set }: { s: AppState; set: (x: AppState) => void }) {
 // ─── Stub tabs ────────────────────────────────────────────────────────────────
 // (Motor de Dinero, Capital, Plan, Tasks — abbreviated for space, full implementations preserved from prior version)
 
-function MoneyTab({ s, set }: { s: AppState; set: (x: AppState) => void }) {
+function MoneyTab({ s, set, hideAmounts, onToggleHide }: { s: AppState; set: (x: AppState) => void; hideAmounts: boolean; onToggleHide: () => void }) {
   const c = s.currency;
   const [sec, setSec] = useState<"goals" | "income" | "expenses" | "debts" | "recurrentes">("goals");
   const [showForm, setShowForm] = useState(false);
@@ -1093,6 +1289,7 @@ function MoneyTab({ s, set }: { s: AppState; set: (x: AppState) => void }) {
       <div className="flex flex-wrap gap-2">
         {([["goals", "⚙️ Metas"], ["income", "💵 Ingresos"], ["expenses", "📊 Gastos"], ["recurrentes", "🔁 Recurrentes"], ["debts", "💳 Deudas"]] as [typeof sec, string][]).map(([id, label]) => (<button key={id} onClick={() => { setSec(id as typeof sec); setShowForm(false); }} className={`px-4 py-2 rounded-xl text-sm font-medium transition-all ${sec === id ? "bg-[#9D4EDD] text-white" : "bg-white/5 text-gray-400 hover:text-white hover:bg-white/8"}`}>{label}</button>))}
         {sec !== "goals" && <button onClick={() => setShowForm(!showForm)} className="ml-auto flex items-center gap-2 px-4 py-2 rounded-xl bg-[#9D4EDD] text-white text-sm font-medium hover:bg-[#7B2CBF]"><Plus size={15} /> Agregar</button>}
+        <EyeToggle hidden={hideAmounts} onToggle={onToggleHide} />
       </div>
 
       {sec === "goals" && (<div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
@@ -1204,7 +1401,7 @@ function MoneyTab({ s, set }: { s: AppState; set: (x: AppState) => void }) {
   );
 }
 
-function CapitalTab({ s, set }: { s: AppState; set: (x: AppState) => void }) {
+function CapitalTab({ s, set, hideAmounts, onToggleHide }: { s: AppState; set: (x: AppState) => void; hideAmounts: boolean; onToggleHide: () => void }) {
   const c = s.currency;
   const [showForm, setShowForm] = useState(false);
   const [abonarId, setAbonarId] = useState<string | null>(null);
@@ -1288,7 +1485,7 @@ function CapitalTab({ s, set }: { s: AppState; set: (x: AppState) => void }) {
       <Card>
         <div className="flex items-center justify-between mb-4">
           <p className="text-xs text-gray-500 uppercase tracking-wider">Metas · Seguimiento monetario</p>
-          <button onClick={() => setShowForm(!showForm)} className="flex items-center gap-1.5 text-xs text-[#c084fc] hover:text-[#9D4EDD]"><Plus size={13} /> Agregar</button>
+          <div className="flex items-center gap-1"><EyeToggle hidden={hideAmounts} onToggle={onToggleHide} /><button onClick={() => setShowForm(!showForm)} className="flex items-center gap-1.5 text-xs text-[#c084fc] hover:text-[#9D4EDD]"><Plus size={13} /> Agregar</button></div>
         </div>
 
         {showForm && (
@@ -1408,7 +1605,8 @@ function TasksTab({ s, set }: { s: AppState; set: (x: AppState) => void }) {
   const [dueDate, setDueDate] = useState(today());
   const [recurringType, setRecurringType] = useState<TaskRecurringType>("none");
   const [isKey, setIsKey] = useState(false);
-  const kDone = s.tasks.filter(t => t.isKey && t.completed).length;
+  const kDone = countKeyTasksDoneToday(s.tasks); // tareas clave completadas HOY (día local)
+  const kShown = Math.min(kDone, 3);
 
   const add = () => {
     if (!newTask.trim()) return;
@@ -1432,7 +1630,7 @@ function TasksTab({ s, set }: { s: AppState; set: (x: AppState) => void }) {
 
   const toggle = (id: string) => set({
     ...s,
-    tasks: s.tasks.map(t => t.id === id ? { ...t, completed: !t.completed, completedAt: !t.completed ? today() : undefined } : t),
+    tasks: s.tasks.map(t => t.id === id ? { ...t, completed: !t.completed, completedAt: !t.completed ? todayLocal() : undefined } : t),
   });
   const remove = (id: string) => set({ ...s, tasks: s.tasks.filter(t => t.id !== id) });
 
@@ -1446,15 +1644,16 @@ function TasksTab({ s, set }: { s: AppState; set: (x: AppState) => void }) {
 
   return (
     <div className="space-y-5 max-w-2xl">
-      <Card className={`border ${kDone >= 3 ? "border-emerald-500/30 bg-emerald-500/5" : "border-white/5"}`}>
+      <Card className={`border ${kShown >= 3 ? "border-emerald-500/30 bg-emerald-500/5" : "border-white/5"}`}>
         <div className="flex items-center justify-between">
           <div>
             <p className="text-xs text-gray-500 uppercase tracking-wider mb-1">Indicador del Día</p>
-            <p className={`text-lg font-bold ${kDone >= 3 ? "text-emerald-400" : "text-white"}`}>{kDone >= 3 ? "✅ 3 Tareas Clave Completadas" : `${kDone} / 3 tareas clave completadas`}</p>
+            <p className={`text-lg font-bold ${kShown >= 3 ? "text-emerald-400" : "text-white"}`}>{kShown >= 3 ? "✅ 3 Tareas Clave Completadas" : `${kShown} / 3 tareas clave completadas`}</p>
+            <p className="text-[10px] text-gray-600">Hoy (día local) · el historial de días anteriores se conserva</p>
           </div>
-          <div className={`w-14 h-14 rounded-2xl flex items-center justify-center text-2xl font-black ${kDone >= 3 ? "bg-emerald-500/20 text-emerald-400" : "bg-[#9D4EDD]/15 text-[#c084fc]"}`}>{kDone}/3</div>
+          <div className={`w-14 h-14 rounded-2xl flex items-center justify-center text-2xl font-black ${kShown >= 3 ? "bg-emerald-500/20 text-emerald-400" : "bg-[#9D4EDD]/15 text-[#c084fc]"}`} title={kDone > 3 ? `${kDone} tareas clave completadas hoy` : undefined}>{kShown}/3{kDone > 3 ? "+" : ""}</div>
         </div>
-        {kDone < 3 && <BarFill value={kDone} max={3} color="#9D4EDD" h={6} />}
+        {kShown < 3 && <BarFill value={kShown} max={3} color="#9D4EDD" h={6} />}
       </Card>
 
       <Card>
@@ -1671,7 +1870,7 @@ const ASSET_TYPES: { id: AssetType; label: string; emoji: string; color: string 
   { id: "other", label: "Otros", emoji: "🗂️", color: "#6b7280" },
 ];
 
-function AssetsTab({ s, set }: { s: AppState; set: (x: AppState) => void }) {
+function AssetsTab({ s, set, hideAmounts, onToggleHide }: { s: AppState; set: (x: AppState) => void; hideAmounts: boolean; onToggleHide: () => void }) {
   const c = s.currency;
   const [showForm, setShowForm] = useState(false);
   const [editId, setEditId] = useState<string | null>(null);
@@ -1722,7 +1921,7 @@ function AssetsTab({ s, set }: { s: AppState; set: (x: AppState) => void }) {
       <Card>
         <div className="flex items-center justify-between mb-4">
           <p className="text-xs text-gray-500 uppercase tracking-wider">Activos registrados</p>
-          <button onClick={() => { setEditId(null); setNa({ name: "", type: "cash", value: "", notes: "" }); setShowForm(!showForm); }} className="flex items-center gap-1.5 text-xs text-[#c084fc] hover:text-[#9D4EDD]"><Plus size={13} /> Agregar activo</button>
+          <div className="flex items-center gap-1"><EyeToggle hidden={hideAmounts} onToggle={onToggleHide} /><button onClick={() => { setEditId(null); setNa({ name: "", type: "cash", value: "", notes: "" }); setShowForm(!showForm); }} className="flex items-center gap-1.5 text-xs text-[#c084fc] hover:text-[#9D4EDD]"><Plus size={13} /> Agregar activo</button></div>
         </div>
 
         {showForm && (
@@ -1995,6 +2194,39 @@ export default function App() {
   const [dirty, setDirty] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
+
+  // ── Preferencia visual "ocultar montos" (Objetivo 3) ─────────────────────────
+  // Vive FUERA de AppState → cambiar la visibilidad NO dispara el autosave de finanzas.
+  // Se persiste en user_settings (vía /settings) y se aplica globalmente en fmt().
+  const [hideAmounts, setHideAmounts] = useState(false);
+  const hideAmountsRef = useRef(false);
+  const userSettingsRef = useRef<any>(null);
+
+  // Cargar preferencias del usuario (settings) al iniciar sesión.
+  useEffect(() => {
+    if (!session?.access_token) return;
+    api.getSettings(session.access_token)
+      .then((res) => {
+        const st = res?.settings ?? {};
+        userSettingsRef.current = st;
+        const h = !!st.hideAmounts;
+        hideAmountsRef.current = h;
+        setHideAmountsGlobal(h);
+        setHideAmounts(h);
+      })
+      .catch(() => {});
+  }, [session?.access_token]);
+
+  const toggleHideAmounts = () => {
+    const next = !hideAmountsRef.current;
+    hideAmountsRef.current = next;
+    setHideAmountsGlobal(next);
+    setHideAmounts(next);
+    const t = sessionRef.current?.access_token;
+    if (!t) return;
+    const base = { ...DEFAULT_SETTINGS, ...(userSettingsRef.current ?? {}) };
+    api.saveSettings(t, { ...base, hideAmounts: next }).catch(() => {});
+  };
 
   // Auth listener
   useEffect(() => {
@@ -2330,7 +2562,7 @@ export default function App() {
   }
 
 
-  const keyDone = data.tasks.filter(t => t.isKey && t.completed).length;
+  const keyDone = Math.min(countKeyTasksDoneToday(data.tasks), 3); // tareas clave HOY (día local)
   const hotProps = (data.businesses || []).filter(b => b.status === "marketing" || b.status === "ventas").length + (data.contacts || []).filter(c => c.status === "cita" || c.status === "apartado" || c.status === "cierre").length;
   const completedGoals = data.goals.filter(g => g.status === "completed").length;
 
@@ -2400,6 +2632,7 @@ export default function App() {
               <div className="hidden md:flex items-center gap-1.5 bg-[#9D4EDD]/10 border border-[#9D4EDD]/20 px-3 py-1.5 rounded-xl">
                 <span className="text-[#c084fc] text-xs font-semibold font-mono">Q{getQ()} · Día {dayOfQNow()}/{getQTotalDays(getQ(), getQYear())}</span>
               </div>
+              <EyeToggle hidden={hideAmounts} onToggle={toggleHideAmounts} label="Mostrar u ocultar montos (toda la app)" />
               <button onClick={() => setShowSettings(!showSettings)} className="w-8 h-8 rounded-xl bg-white/5 flex items-center justify-center text-gray-400 hover:text-white hover:bg-white/10 transition-all lg:hidden"><Settings size={15} /></button>
             </div>
           </div>
@@ -2415,10 +2648,10 @@ export default function App() {
               <button onClick={() => setSaveError(null)} className="text-red-400/70 hover:text-red-300 shrink-0" aria-label="Cerrar aviso"><X size={15} /></button>
             </div>
           )}
-          {tab === "dashboard" && <DashboardTab s={data} set={setData} />}
-          {tab === "money" && <MoneyTab s={data} set={setData} />}
-          {tab === "capital" && <CapitalTab s={data} set={setData} />}
-          {tab === "activos" && <AssetsTab s={data} set={setData} />}
+          {tab === "dashboard" && <DashboardTab s={data} set={setData} hideAmounts={hideAmounts} onToggleHide={toggleHideAmounts} />}
+          {tab === "money" && <MoneyTab s={data} set={setData} hideAmounts={hideAmounts} onToggleHide={toggleHideAmounts} />}
+          {tab === "capital" && <CapitalTab s={data} set={setData} hideAmounts={hideAmounts} onToggleHide={toggleHideAmounts} />}
+          {tab === "activos" && <AssetsTab s={data} set={setData} hideAmounts={hideAmounts} onToggleHide={toggleHideAmounts} />}
           {tab === "plan" && <PlanTab s={data} set={setData} />}
           {tab === "tasks" && <TasksTab s={data} set={setData} />}
           {tab === "crm" && <CRMTab s={data} set={setData} />}

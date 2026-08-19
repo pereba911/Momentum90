@@ -47,6 +47,7 @@ export interface UserSettings {
   language: "es" | "en";
   fundLabels: { emergency: string; investment: string; custom: string };
   stripeUrl: string;
+  hideAmounts?: boolean; // preferencia visual (no es dato financiero)
 }
 
 export type AppEntityName =

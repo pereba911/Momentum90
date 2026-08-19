@@ -324,12 +324,21 @@ app.post("/make-server-da3143e6/admin/users", async (c) => {
   const trialEnd = new Date(now.getTime() + days * 86400000);
 
   // Idempotencia: si el usuario ya existe, NO duplicamos la cuenta;
-  // solo actualizamos su trial de forma segura.
-  const { data: existingUser, error: findError } = await adminClient().auth.admin.getUserByEmail(normalizedEmail);
-  if (findError && findError.status !== 404) throw new Error(findError.message);
+  // solo actualizamos su trial de forma segura. Búsqueda PAGINADA por email
+  // con admin.listUsers (compatible con la versión de supabase-js del edge runtime).
+  let existingUser: { id: string; email?: string | null } | null = null;
+  const perPage = 200;
+  for (let page = 1; page <= 50; page++) {
+    const { data: pageData, error: listError } = await adminClient().auth.admin.listUsers({ page, perPage });
+    if (listError) throw new Error(listError.message);
+    const users = pageData?.users ?? [];
+    const found = users.find((u: any) => String(u.email ?? "").trim().toLowerCase() === normalizedEmail);
+    if (found) { existingUser = { id: found.id, email: found.email }; break; }
+    if (users.length < perPage) break; // última página alcanzada
+  }
 
-  if (existingUser?.user) {
-    const existingId = existingUser.user.id;
+  if (existingUser) {
+    const existingId = existingUser.id;
     const profile = makeDefaultProfile({ id: existingId, email: normalizedEmail });
     const { error: upsertError } = await adminClient().from("user_profiles").upsert({
       ...profile,
