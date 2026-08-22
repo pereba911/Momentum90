@@ -6,7 +6,7 @@ import {
   Building2, Pencil, ChevronLeft, ChevronRight, Star,
   LogOut, Lock, Mail, Eye, EyeOff, Award, Flame, RefreshCw,
   Wallet, ShieldCheck, Users, Plug, AlertCircle, Info,
-  FileDown, ChevronUp
+  FileDown, ChevronUp, History
 } from "lucide-react";
 import { api, supabase, SUPABASE_CONFIGURED, DEFAULT_SETTINGS, type AppEntityName, type Asset, type AssetType, type IntegrationConfig } from "../lib/supabase";
 import { buildExpenseReportPdf } from "./reportPdf";
@@ -41,11 +41,24 @@ interface Income {
   amountCollected?: number;      // cobrado acumulado (default derivado del estado histórico)
   paymentHistory?: IncomePayment[]; // historial de abonos/pagos parciales (nunca se borra: se anula con voided)
   expectedDate?: string;         // fecha estimada de cobro
+  notes?: string;                // notas (FASE 4)
   goalId?: string; goalAllocation?: string; // abono a meta monetaria (campo ya usado en el formulario)
 }
 interface Expense { id: string; date: string; category: string; businessCategory: string; description: string; amount: number; recurring?: boolean; }
-interface Debt { id: string; name: string; balance: number; minPayment: number; targetPayment: number; originalBalance: number; targetDate: string; }
+interface DebtPayment { id: string; date: string; amount: number; note?: string; voided?: boolean; voidedAt?: string; }
+interface Debt {
+  id: string; name: string; balance: number; minPayment: number; targetPayment: number; originalBalance: number; targetDate: string;
+  // Campos aditivos FASE 2 — opcionales para compatibilidad con deudas históricas.
+  lender?: string;      // acreedor / origen
+  category?: string;    // categoría de la deuda
+  notes?: string;
+  dueDate?: string;     // fecha de vencimiento
+  payments?: DebtPayment[]; // historial de abonos (nunca se borra: se anula con voided)
+  amountPaid?: number;  // derivado (abonado acumulado)
+  status?: "Pendiente" | "Liquidada"; // derivado
+}
 interface StressEntry { date: string; level: number; }
+interface GoalProgressEntry { id: string; date: string; amount: number; note?: string; voided?: boolean; voidedAt?: string; }
 interface Goal {
   id: string; title: string; type: "annual" | "quarterly"; quarter?: number;
   category?: GoalCategory;
@@ -55,6 +68,11 @@ interface Goal {
   status: GoalStatus;
   kind: GoalKind;          // money | habit | task
   completedAt?: string;
+  // Campos aditivos FASE B — opcionales para compatibilidad con metas históricas.
+  dueDate?: string;                 // fecha límite
+  priority?: "alta" | "media" | "baja";
+  notes?: string;
+  progressHistory?: GoalProgressEntry[]; // historial de avances (nunca se borra: se anula con voided)
 }
 interface Task {
   id: string;
@@ -82,8 +100,21 @@ interface Contact {
 interface RecurringExpense { id: string; category: string; businessCategory: string; description: string; amount: number; active: boolean; }
 interface MiniVictory { id: string; text: string; date: string; category: "task" | "goal" | "habit" | "manual"; emoji: string; }
 interface QuarterSnapshot { year: number; quarter: number; totalDays: number; goalsCompleted: number; incomeCollected: number; miniVictoriesCount: number; avgCeoScore: number; }
+// Ajustes manuales de la Base financiera (FASE 3): capa auditable, separada de los cálculos automáticos.
+interface FinanceAdjustment {
+  id: string;
+  amount: number;      // positivo o negativo
+  date: string;        // YYYY-MM-DD
+  reason: string;      // motivo obligatorio
+  note?: string;
+  createdAt: string;
+  updatedAt: string;
+  voided?: boolean;
+  voidedAt?: string;
+}
 interface AppState {
   finance: { cash: number; receivable: number; totalDebt: number; monthlyExpense: number };
+  financeAdjustments: FinanceAdjustment[];
   monthlyGoal: { target: number }; quarterlyGoal: { target: number };
   stageNames: [string, string, string];
   currency: Currency;
@@ -321,6 +352,104 @@ function validateIncomes(list: unknown): list is Income[] {
 }
 function sanitizeFileName(s: string): string { return s.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/-+/g, "-").replace(/^-|-$/g, ""); }
 
+// ── Deudas: saldos, abonos y estado derivado (FASE 2) ─────────────────────────
+function debtIsLegacy(d: Debt): boolean { return d.payments == null && d.amountPaid == null; }
+// Abonado acumulado: si hay historial, suma de abonos no anulados; si es legacy, original − balance.
+function debtPaid(d: Debt): number {
+  if (Array.isArray(d.payments) && d.payments.length > 0) return d.payments.filter(p => !p.voided).reduce((a, p) => a + (Number(p.amount) || 0), 0);
+  if (typeof d.amountPaid === "number" && Number.isFinite(d.amountPaid)) return d.amountPaid;
+  const total = Number(d.originalBalance) || 0; const bal = Number(d.balance) || 0;
+  return Math.max(0, total - bal); // legacy: original − balance
+}
+// Saldo pendiente = original − abonado (mín 0). En legacy, balance vigente.
+function debtSaldo(d: Debt): number {
+  const total = Number(d.originalBalance) || Number(d.balance) || 0;
+  return Math.max(0, total - debtPaid(d));
+}
+function debtStatus(d: Debt): "Pendiente" | "Liquidada" { return debtSaldo(d) <= 0 ? "Liquidada" : "Pendiente"; }
+// Recalcula campos derivados SOLO para deudas en formato nuevo (nunca toca legacy).
+function recomputeDebt(d: Debt): Debt {
+  if (debtIsLegacy(d)) return d;
+  const paid = debtPaid(d);
+  const total = Number(d.originalBalance) > 0 ? Number(d.originalBalance) : (Number(d.balance) || 0);
+  return { ...d, originalBalance: total, amountPaid: paid, status: paid >= total ? "Liquidada" : "Pendiente" };
+}
+// Deuda total (automática): suma de saldos pendientes de deudas que YO debo.
+function deudaTotalAuto(s: AppState): number { return (s.debts || []).reduce((a, d) => a + debtSaldo(d), 0); }
+function validateDebts(list: unknown): list is Debt[] {
+  if (!Array.isArray(list)) return false;
+  return list.every(x => {
+    const it = x as any;
+    if (!it || typeof it !== "object" || typeof it.id !== "string") return false;
+    if (!Number.isFinite(Number(it.balance))) return false;
+    if (it.payments != null) {
+      if (!Array.isArray(it.payments)) return false;
+      if (!it.payments.every((p: any) => p && typeof p.id === "string" && typeof p.date === "string" && Number.isFinite(Number(p.amount)))) return false;
+    }
+    return true;
+  });
+}
+// ── Base financiera automática + ajustes manuales (FASE 3) ────────────────────
+// Efectivo cobrado automático = suma de ingresos/abonos efectivamente cobrados (cada abono una sola vez).
+function efectivoCobradoAuto(s: AppState): number { return (s.incomes || []).reduce((a, i) => a + incomeCollected(i), 0); }
+function ajustesManualesSum(s: AppState): number { return (s.financeAdjustments || []).filter(a => !a.voided).reduce((a, x) => a + (Number(x.amount) || 0), 0); }
+// Total líquido calculado = efectivo cobrado auto + ajustes manuales (NUNCA se suma a finance.cash).
+function totalLiquidoCalculado(s: AppState): number { return efectivoCobradoAuto(s) + ajustesManualesSum(s); }
+function validateAdjustment(x: FinanceAdjustment): boolean {
+  return !!x && typeof x.id === "string" && Number.isFinite(Number(x.amount)) && typeof x.date === "string" && typeof x.reason === "string" && x.reason.trim().length > 0;
+}
+// Formato monetario exacto a 2 decimales (precisión de centavos).
+function fmtExact(n: number, c: Currency = "MXN"): string {
+  const sym: Record<Currency, string> = { MXN: "$", USD: "US$", EUR: "€" };
+  if (hideAmountsGlobal) return `${sym[c]} ••••••`;
+  const v = Math.round(n * 100) / 100;
+  return `${sym[c]}${v.toLocaleString("es-MX", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
+// ── Metas editables + historial de avances (FASE B) ───────────────────────────
+// Avance acumulado real de una meta = suma de abonos NO anulados; si no hay
+// historial (meta histórica) usa currentAmount tal cual (compatibilidad).
+function goalAccumulated(g: Goal): number {
+  if (g.progressHistory && g.progressHistory.length > 0) return g.progressHistory.filter(p => !p.voided).reduce((a, p) => a + (Number(p.amount) || 0), 0);
+  return g.currentAmount ?? 0;
+}
+// Recalcula progreso/estado de una meta monetaria SIN tocar el avance acumulado.
+function goalRecalc(g: Goal): Goal {
+  if (g.kind !== "money" || !g.targetAmount || g.targetAmount <= 0) return g;
+  const cur = goalAccumulated(g);
+  const np = Math.min(100, pct(cur, g.targetAmount));
+  return {
+    ...g,
+    progress: Math.round(np),
+    status: cur >= g.targetAmount ? "completed" : cur > 0 ? "in-progress" : "active",
+    completedAt: cur >= g.targetAmount ? (g.completedAt ?? today()) : undefined,
+  };
+}
+// ── Activos (FASE B) ──────────────────────────────────────────────────────────
+// Activos potenciales = oportunidades/proyecciones del pipeline de negocios con
+// monto potencial (value > 0). NUNCA se convierten a efectivo por cambiar de etapa.
+function activosPotenciales(s: AppState): number {
+  return (s.businesses || []).reduce((a, b) => a + (Number(b.value) || 0), 0);
+}
+// Total de activos (fórmula aprobada FASE B) = Total líquido calculado + Activos potenciales.
+function totalActivosCalculado(s: AppState): number { return totalLiquidoCalculado(s) + activosPotenciales(s); }
+// Desglose de activos potenciales por categoría y por etapa.
+function desglosePotenciales(s: AppState): { byCat: { k: string; v: number }[]; byStage: { k: string; v: number }[] } {
+  const items = (s.businesses || []).filter(b => Number(b.value) > 0);
+  const catMap = new Map<string, number>();
+  const stageMap = new Map<string, number>();
+  for (const b of items) {
+    const cat = (b.category || "").trim() || "Sin categoría";
+    const st = BIZ_STATUS.find(x => x.id === b.status)?.label ?? b.status ?? "Sin etapa";
+    catMap.set(cat, (catMap.get(cat) || 0) + (Number(b.value) || 0));
+    stageMap.set(st, (stageMap.get(st) || 0) + (Number(b.value) || 0));
+  }
+  return {
+    byCat: [...catMap.entries()].map(([k, v]) => ({ k, v })).sort((a, b) => b.v - a.v),
+    byStage: [...stageMap.entries()].map(([k, v]) => ({ k, v })).sort((a, b) => b.v - a.v),
+  };
+}
+
 // ── Estrés financiero (Objetivo 5) ────────────────────────────────────────────
 function clamp(v: number, lo: number, hi: number): number { return Math.min(hi, Math.max(lo, v)); }
 function goalDeadline(g: Goal): { start: Date; end: Date } | null {
@@ -431,6 +560,7 @@ function reconcileRemoteState(remoteData: Partial<AppState> | null | undefined, 
 
 const INIT: AppState = {
   finance: { cash: 0, receivable: 0, totalDebt: 0, monthlyExpense: 0 },
+  financeAdjustments: [],
   monthlyGoal: { target: 0 }, quarterlyGoal: { target: 0 },
   stageNames: ["Estabilización", "Recuperación", "Expansión"],
   currency: "MXN",
@@ -801,13 +931,13 @@ function DashboardTab({ s, set, hideAmounts, onToggleHide }: { s: AppState; set:
           const colchonVal = ch.months == null
             ? "Sin gastos fijos registrados"
             : hideAmounts
-              ? `${fmt(fd, c)} · •••• meses de cobertura`
-              : `${fmt(fd, c)} · ${ch.months.toFixed(2)} meses de cobertura`;
-          const colchonSub = ch.months == null ? "Registra gastos fijos para calcularlo" : `Gastos fijos: ${fmt(ch.fixed, c)}/mes`;
+              ? `${fmtExact(fd, c)} · •••• meses de cobertura`
+              : `${fmtExact(fd, c)} · ${ch.months.toFixed(2)} meses de cobertura`;
+          const colchonSub = ch.months == null ? "Registra gastos fijos para calcularlo" : `Gastos fijos: ${fmtExact(ch.fixed, c)}/mes`;
           return [
-            { label: "Flujo disponible", val: fmt(fd, c), sub: "Líquido actual", emoji: "💵", accent: "#10B981", trend: "up" as const, tip: "Dinero realmente disponible (finance.cash). No incluye ingresos por cobrar." },
-            { label: "Flujo por cobrar", val: fmt(fpc, c), sub: "Saldos pendientes", emoji: "⏳", accent: "#F59E0B", trend: "flat" as const, tip: "Suma de saldos pendientes de ingresos/comisiones en estado Por cobrar (no cuenta lo ya abonado/cobrado)." },
-            { label: "Deuda total", val: fmt(dt, c), sub: `${s.debts.length} cuentas`, emoji: "💳", accent: "#EF4444", trend: "down" as const, tip: "Total de deudas que debes. No incluye dinero que te deben ni por cobrar." },
+            { label: "Flujo disponible", val: fmtExact(fd, c), sub: "Líquido actual", emoji: "💵", accent: "#10B981", trend: "up" as const, tip: "Dinero realmente disponible (finance.cash manual). No incluye ingresos por cobrar ni el total líquido calculado." },
+            { label: "Flujo por cobrar", val: fmtExact(fpc, c), sub: "Saldos pendientes", emoji: "⏳", accent: "#F59E0B", trend: "flat" as const, tip: "Suma de saldos pendientes de ingresos/comisiones en estado Por cobrar (no cuenta lo ya abonado/cobrado)." },
+            { label: "Deuda total", val: fmtExact(dt, c), sub: `${s.debts.length} cuentas`, emoji: "💳", accent: "#EF4444", trend: "down" as const, tip: "Suma de saldos pendientes de deudas que debes. No incluye dinero que te deben ni por cobrar." },
             { label: "Colchón", val: colchonVal, sub: colchonSub, emoji: "🛟", accent: ch.months == null ? "#6b7280" : ch.months >= 3 ? "#10B981" : ch.months >= 1 ? "#F59E0B" : "#EF4444", trend: undefined, tip: "Colchón = Flujo disponible ÷ gastos fijos mensuales. Meses con máximo 2 decimales." },
           ];
         })().map(({ label, val, sub, emoji, accent, trend, tip }) => (
@@ -825,13 +955,13 @@ function DashboardTab({ s, set, hideAmounts, onToggleHide }: { s: AppState; set:
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         <Card>
           <div className="flex items-start justify-between mb-1"><p className="text-xs text-gray-500 uppercase tracking-wider">Meta Mensual · {cap(monthLabel())}</p><Bdg color={mP >= 80 ? "green" : mP >= 50 ? "yellow" : "purple"}>{mP}%</Bdg></div>
-          <div className="flex items-end justify-between mt-3 mb-3"><div><p className="text-3xl font-black text-white">{fmt(mColl, c)}</p><p className="text-sm text-gray-500">de <span className="text-gray-300">{fmt(s.monthlyGoal.target, c)}</span></p></div>{s.monthlyGoal.target - mColl > 0 ? <p className="text-sm text-amber-400 font-semibold text-right">Faltan<br />{fmt(s.monthlyGoal.target - mColl, c)}</p> : <p className="text-sm text-emerald-400 font-semibold text-right">✓ Meta<br />cumplida</p>}</div>
+          <div className="flex items-end justify-between mt-3 mb-3"><div><p className="text-3xl font-black text-white">{fmtExact(mColl, c)}</p><p className="text-sm text-gray-500">de <span className="text-gray-300">{fmtExact(s.monthlyGoal.target, c)}</span></p></div>{s.monthlyGoal.target - mColl > 0 ? <p className="text-sm text-amber-400 font-semibold text-right">Faltan<br />{fmtExact(s.monthlyGoal.target - mColl, c)}</p> : <p className="text-sm text-emerald-400 font-semibold text-right">✓ Meta<br />cumplida</p>}</div>
           <BarFill value={mColl} max={s.monthlyGoal.target} color={mP >= 80 ? "#10B981" : "#9D4EDD"} h={10} />
           <p className="text-[11px] text-gray-600 mt-2">Solo ingresos cobrados · configurable en Motor de Dinero</p>
         </Card>
         <Card>
           <div className="flex items-start justify-between mb-1"><p className="text-xs text-gray-500 uppercase tracking-wider">Acumulado Q{q} · {qMo[q]} {qYear}</p><Bdg color={qP >= 80 ? "green" : qP >= 50 ? "yellow" : "purple"}>{qP}%</Bdg></div>
-          <div className="flex items-end justify-between mt-3 mb-3"><div><p className="text-3xl font-black text-white">{fmt(qColl, c)}</p><p className="text-sm text-gray-500">de <span className="text-gray-300">{fmt(s.quarterlyGoal.target, c)}</span></p></div>{s.quarterlyGoal.target - qColl > 0 ? <p className="text-sm text-amber-400 font-semibold text-right">Faltan<br />{fmt(s.quarterlyGoal.target - qColl, c)}</p> : <p className="text-sm text-emerald-400 font-semibold text-right">✓ Meta Q<br />cumplida</p>}</div>
+          <div className="flex items-end justify-between mt-3 mb-3"><div><p className="text-3xl font-black text-white">{fmtExact(qColl, c)}</p><p className="text-sm text-gray-500">de <span className="text-gray-300">{fmtExact(s.quarterlyGoal.target, c)}</span></p></div>{s.quarterlyGoal.target - qColl > 0 ? <p className="text-sm text-amber-400 font-semibold text-right">Faltan<br />{fmtExact(s.quarterlyGoal.target - qColl, c)}</p> : <p className="text-sm text-emerald-400 font-semibold text-right">✓ Meta Q<br />cumplida</p>}</div>
           <BarFill value={qColl} max={s.quarterlyGoal.target} color={qP >= 80 ? "#10B981" : "#3B82F6"} h={10} />
           <div className="flex justify-between mt-2"><p className="text-[11px] text-gray-600">Día {dInQ}/{qTotal} del Q{q}</p><p className="text-[11px] text-gray-600">{qTotal - dInQ} días restantes</p></div>
         </Card>
@@ -841,7 +971,7 @@ function DashboardTab({ s, set, hideAmounts, onToggleHide }: { s: AppState; set:
       <Card>
         <p className="text-xs text-gray-500 uppercase tracking-wider mb-3">Pipeline General</p>
         <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-          {[["Cobrado este mes", fmt(mColl, c), "#10B981"], [`Cobrado Q${q}`, fmt(qColl, c), "#3B82F6"], ["Proyectado / prospectos", fmt(pipeline, c), "#F59E0B"], ["CRM activo", fmt(crmPipeline, c), "#9D4EDD"]].map(([l, v, col]) => (
+          {[["Cobrado este mes", fmtExact(mColl, c), "#10B981"], [`Cobrado Q${q}`, fmtExact(qColl, c), "#3B82F6"], ["Proyectado / prospectos", fmtExact(pipeline, c), "#F59E0B"], ["CRM activo", fmtExact(crmPipeline, c), "#9D4EDD"]].map(([l, v, col]) => (
             <div key={l as string} className="bg-[#0D0D12] rounded-xl p-3 border border-white/5"><p className="text-[11px] text-gray-500 mb-1">{l as string}</p><p className="font-bold text-base" style={{ color: col as string }}>{v as string}</p></div>
           ))}
         </div>
@@ -882,7 +1012,7 @@ function DashboardTab({ s, set, hideAmounts, onToggleHide }: { s: AppState; set:
           <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
             {s.goals.map(g => {
               const goalProgress = g.kind === "money" && g.targetAmount ? pct(g.currentAmount ?? 0, g.targetAmount) : g.progress;
-              return (<div key={g.id} className="bg-[#0D0D12] border border-white/5 rounded-xl p-3 hover:border-white/10 transition-all"><div className="flex items-start justify-between gap-2 mb-2"><span className="text-sm text-gray-200 font-medium leading-snug">{g.title}</span><Bdg color={g.status === "completed" ? "green" : goalProgress >= 70 ? "purple" : "gray"}>{goalProgress}%</Bdg></div><BarFill value={goalProgress} max={100} h={5} color={g.status === "completed" ? "#10B981" : "#9D4EDD"} />{g.targetAmount ? <p className="text-[11px] text-gray-600 mt-1">{fmt(g.currentAmount ?? 0, c)} / {fmt(g.targetAmount, c)}</p> : null}</div>);
+              return (<div key={g.id} className="bg-[#0D0D12] border border-white/5 rounded-xl p-3 hover:border-white/10 transition-all"><div className="flex items-start justify-between gap-2 mb-2"><span className="text-sm text-gray-200 font-medium leading-snug">{g.title}</span><Bdg color={g.status === "completed" ? "green" : goalProgress >= 70 ? "purple" : "gray"}>{goalProgress}%</Bdg></div><BarFill value={goalProgress} max={100} h={5} color={g.status === "completed" ? "#10B981" : "#9D4EDD"} />{g.targetAmount ? <p className="text-[11px] text-gray-600 mt-1">{fmtExact(g.currentAmount ?? 0, c)} / {fmtExact(g.targetAmount, c)}</p> : null}</div>);
             })}
           </div>
         </Card>
@@ -950,7 +1080,7 @@ function CRMTab({ s, set }: { s: AppState; set: (x: AppState) => void }) {
           ))}
         </div>
         <div className="flex items-center gap-3 text-sm text-gray-400">
-          <span>En Ventas: <span className="text-emerald-400 font-bold">{fmt(totalBizPipeline, c)}</span></span>
+          <span>En Ventas: <span className="text-emerald-400 font-bold">{fmtExact(totalBizPipeline, c)}</span></span>
           <span>Activos: <span className="text-[#c084fc] font-bold">{activeBiz}</span></span>
         </div>
         {view === "negocios" ? (
@@ -1341,11 +1471,11 @@ function LogrosTab({ s, set }: { s: AppState; set: (x: AppState) => void }) {
 // ─── Stub tabs ────────────────────────────────────────────────────────────────
 // (Motor de Dinero, Capital, Plan, Tasks — abbreviated for space, full implementations preserved from prior version)
 
-function MoneyTab({ s, set, hideAmounts, onToggleHide, onMutateIncomes }: { s: AppState; set: (x: AppState) => void; hideAmounts: boolean; onToggleHide: () => void; onMutateIncomes?: (updater: (prev: Income[]) => Income[]) => Promise<boolean> }) {
+function MoneyTab({ s, set, hideAmounts, onToggleHide, onMutateIncomes, onMutateDebts }: { s: AppState; set: (x: AppState) => void; hideAmounts: boolean; onToggleHide: () => void; onMutateIncomes?: (updater: (prev: Income[]) => Income[]) => Promise<boolean>; onMutateDebts?: (updater: (prev: Debt[]) => Debt[]) => Promise<boolean> }) {
   const c = s.currency;
   const [sec, setSec] = useState<"goals" | "income" | "expenses" | "debts" | "recurrentes">("goals");
   const [showForm, setShowForm] = useState(false);
-  const [ni, setNi] = useState({ date: today(), type: "", description: "", amount: "", initialPayment: "", expectedDate: "", source: "", goalId: "", goalAllocation: "" });
+  const [ni, setNi] = useState({ date: today(), type: "", description: "", amount: "", initialPayment: "", expectedDate: "", notes: "", source: "", goalId: "", goalAllocation: "" });
   const [ne, setNe] = useState({ date: today(), category: "", businessCategory: "", description: "", amount: "", recurring: false });
   // Modal de distribución de ingreso
   const [allocateIncome, setAllocateIncome] = useState<Income | null>(null);
@@ -1356,11 +1486,27 @@ function MoneyTab({ s, set, hideAmounts, onToggleHide, onMutateIncomes }: { s: A
   const [incomeMsg, setIncomeMsg] = useState<{ kind: "ok" | "err"; text: string } | null>(null);
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [editingIncome, setEditingIncome] = useState<Income | null>(null);
-  const [editForm, setEditForm] = useState({ description: "", source: "", type: "", total: "", expectedDate: "" });
+  const [editForm, setEditForm] = useState({ description: "", source: "", type: "", total: "", expectedDate: "", notes: "" });
   const [abonarIncome, setAbonarIncome] = useState<Income | null>(null);
   const [abono, setAbono] = useState({ amount: "", date: today(), note: "" });
   const [confirmExcedente, setConfirmExcedente] = useState<{ income: Income; amount: number; date: string; note: string; excedente: number } | null>(null);
   const [confirmAnular, setConfirmAnular] = useState<{ income: Income; payment: IncomePayment } | null>(null);
+  // FASE 2 — deudas: editar / abonar / anular / historial
+  const [debtBusy, setDebtBusy] = useState(false);
+  const [debtMsg, setDebtMsg] = useState<{ kind: "ok" | "err"; text: string } | null>(null);
+  const [expandedDebtId, setExpandedDebtId] = useState<string | null>(null);
+  const [editingDebt, setEditingDebt] = useState<Debt | null>(null);
+  const [editDebtForm, setEditDebtForm] = useState({ name: "", lender: "", category: "", notes: "", originalBalance: "", balance: "", minPayment: "", targetPayment: "", targetDate: "", dueDate: "" });
+  const [abonarDebt, setAbonarDebt] = useState<Debt | null>(null);
+  const [abonoDebt, setAbonoDebt] = useState({ amount: "", date: today(), note: "" });
+  const [confirmDebtExcedente, setConfirmDebtExcedente] = useState<{ debt: Debt; amount: number; date: string; note: string; excedente: number } | null>(null);
+  const [confirmAnularAbono, setConfirmAnularAbono] = useState<{ debt: Debt; payment: DebtPayment } | null>(null);
+  // FASE 3 — ajustes manuales de la Base financiera
+  const [showAdjForm, setShowAdjForm] = useState(false);
+  const [editingAdj, setEditingAdj] = useState<FinanceAdjustment | null>(null);
+  const [adjForm, setAdjForm] = useState({ amount: "", date: today(), reason: "", note: "" });
+  const [adjMsg, setAdjMsg] = useState<string | null>(null);
+  const [confirmVoidAdj, setConfirmVoidAdj] = useState<FinanceAdjustment | null>(null);
   // Objetivo 2 — reporte PDF de gastos
   const [repPeriod, setRepPeriod] = useState<"week" | "month" | "quarter" | "custom">("month");
   const [repCustom, setRepCustom] = useState({ from: "", to: "" });
@@ -1376,6 +1522,60 @@ function MoneyTab({ s, set, hideAmounts, onToggleHide, onMutateIncomes }: { s: A
     else { if (!repCustom.from || !repCustom.to) { setRepMsg("Selecciona el rango personalizado."); return; } if (repCustom.from > repCustom.to) { setRepMsg("La fecha inicial no puede ser mayor a la final."); return; } from = repCustom.from; to = repCustom.to; label = "Personalizado"; }
     const res = buildExpenseReportPdf({ currency: c, expenses: s.expenses, recurringExpenses: s.recurringExpenses, from, to, label });
     setRepMsg(`Reporte generado: ${res.filename} (${res.nExpenses} gasto(s)). Descarga iniciada.`);
+  };
+  // ── FASE 2: manejadores de deudas (guardado verificado) ─────────────────────
+  const saveDebtAbono = async (debt: Debt) => {
+    const amount = Number(abonoDebt.amount);
+    if (!(amount > 0) || !abonoDebt.date) { setDebtMsg({ kind: "err", text: "Ingresa un monto válido y una fecha." }); return; }
+    const saldo = debtSaldo(debt);
+    if (amount > saldo) { setConfirmDebtExcedente({ debt, amount, date: abonoDebt.date, note: abonoDebt.note, excedente: amount - saldo }); return; }
+    setDebtBusy(true); setDebtMsg(null);
+    const ok = onMutateDebts ? await onMutateDebts(prev => prev.map(x => x.id === debt.id
+      ? recomputeDebt({ ...x, payments: [...(x.payments || []), { id: uid(), date: abonoDebt.date, amount, note: abonoDebt.note.trim() || undefined }] })
+      : x)) : false;
+    setDebtBusy(false);
+    if (ok) { setDebtMsg({ kind: "ok", text: "Abono registrado." }); setAbonarDebt(null); setAbonoDebt({ amount: "", date: today(), note: "" }); }
+  };
+  const saveDebtEdit = async () => {
+    if (!editingDebt) return;
+    if (!editDebtForm.name || !editDebtForm.originalBalance || Number(editDebtForm.originalBalance) <= 0) { setDebtMsg({ kind: "err", text: "Escribe un nombre y un monto original válido." }); return; }
+    const total = Number(editDebtForm.originalBalance);
+    const paid = debtPaid(editingDebt);
+    if (total < paid) { setDebtMsg({ kind: "err", text: `El monto original no puede ser menor a lo ya abonado (${fmtExact(paid, c)}).` }); return; }
+    setDebtBusy(true); setDebtMsg(null);
+    const ok = onMutateDebts ? await onMutateDebts(prev => prev.map(x => x.id === editingDebt.id
+      ? recomputeDebt({ ...x, name: editDebtForm.name.trim(), lender: editDebtForm.lender.trim() || undefined, category: editDebtForm.category.trim() || undefined, notes: editDebtForm.notes.trim() || undefined, originalBalance: total, balance: Math.max(0, total - paid), minPayment: Number(editDebtForm.minPayment) || 0, targetPayment: Number(editDebtForm.targetPayment) || 0, targetDate: editDebtForm.targetDate || "", dueDate: editDebtForm.dueDate || undefined })
+      : x)) : false;
+    setDebtBusy(false);
+    if (ok) { setDebtMsg({ kind: "ok", text: "Deuda actualizada." }); setEditingDebt(null); }
+  };
+  const anularDebtAbono = async () => {
+    if (!confirmAnularAbono) return;
+    setDebtBusy(true); setDebtMsg(null);
+    const { debt, payment } = confirmAnularAbono;
+    const ok = onMutateDebts ? await onMutateDebts(prev => prev.map(x => x.id === debt.id
+      ? recomputeDebt({ ...x, payments: (x.payments || []).map(p => p.id === payment.id ? { ...p, voided: true, voidedAt: new Date().toISOString(), note: p.note ? `${p.note} · Anulado` : "Anulado" } : p) })
+      : x)) : false;
+    setDebtBusy(false);
+    if (ok) { setDebtMsg({ kind: "ok", text: "Abono anulado. Saldo recalculado." }); setConfirmAnularAbono(null); }
+  };
+  // ── FASE 3: manejadores de ajustes manuales (capa auditable) ────────────────
+  const saveAdjustment = () => {
+    const amount = Number(adjForm.amount);
+    const reason = adjForm.reason.trim();
+    if (!(Number.isFinite(amount) && amount !== 0)) { setAdjMsg("El monto no puede ser 0."); return; }
+    if (!reason) { setAdjMsg("El motivo es obligatorio."); return; }
+    const now = new Date().toISOString();
+    const existing = s.financeAdjustments || [];
+    if (editingAdj) {
+      set({ ...s, financeAdjustments: existing.map(a => a.id === editingAdj.id ? { ...a, amount, date: adjForm.date, reason, note: adjForm.note.trim() || undefined, updatedAt: now } : a) });
+      setAdjMsg("Ajuste actualizado.");
+    } else {
+      const na: FinanceAdjustment = { id: uid(), amount, date: adjForm.date, reason, note: adjForm.note.trim() || undefined, createdAt: now, updatedAt: now };
+      set({ ...s, financeAdjustments: [...existing, na] });
+      setAdjMsg("Ajuste registrado.");
+    }
+    setEditingAdj(null); setAdjForm({ amount: "", date: today(), reason: "", note: "" }); setShowAdjForm(false);
   };
   const mColl = calcMonthlyCollected(s.incomes); const qColl = calcQCollected(s.incomes);
   const q = getQ(); const qMo: Record<number, string> = { 1: "Ene–Mar", 2: "Abr–Jun", 3: "Jul–Sep", 4: "Oct–Dic" };
@@ -1396,9 +1596,76 @@ function MoneyTab({ s, set, hideAmounts, onToggleHide, onMutateIncomes }: { s: A
       </div>
 
       {sec === "goals" && (<div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        <Card><p className="text-xs text-gray-500 uppercase tracking-wider mb-4">Meta Mensual</p><div className="space-y-3"><div><label className="text-xs text-gray-500 mb-1.5 block">Meta mensual ({c})</label><input type="number" defaultValue={s.monthlyGoal.target} onBlur={e => set({ ...s, monthlyGoal: { target: Number(e.target.value) } })} className="w-full bg-[#0D0D12] border border-white/10 text-white rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-[#9D4EDD]/60" /></div><div className="bg-[#0D0D12] rounded-xl p-4 border border-white/5 space-y-2">{[["Cobrado este mes", fmt(mColl, c), "text-emerald-400"], ["Meta", fmt(s.monthlyGoal.target, c), "text-white"], ["Faltante", fmt(Math.max(0, s.monthlyGoal.target - mColl), c), "text-amber-400"]].map(([l, v, cl]) => (<div key={l as string} className="flex justify-between text-sm"><span className="text-gray-400">{l as string}</span><span className={`font-bold ${cl as string}`}>{v as string}</span></div>))}<BarFill value={mColl} max={s.monthlyGoal.target} color="#9D4EDD" h={8} /></div></div></Card>
-        <Card><p className="text-xs text-gray-500 uppercase tracking-wider mb-4">Meta Trimestral Q{q} · {qMo[q]}</p><div className="space-y-3"><div><label className="text-xs text-gray-500 mb-1.5 block">Meta Q{q} ({c})</label><input type="number" defaultValue={s.quarterlyGoal.target} onBlur={e => set({ ...s, quarterlyGoal: { target: Number(e.target.value) } })} className="w-full bg-[#0D0D12] border border-white/10 text-white rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-[#9D4EDD]/60" /></div><div className="bg-[#0D0D12] rounded-xl p-4 border border-white/5 space-y-2">{[["Cobrado Q" + q, fmt(qColl, c), "text-blue-400"], ["Meta", fmt(s.quarterlyGoal.target, c), "text-white"], ["Faltante", fmt(Math.max(0, s.quarterlyGoal.target - qColl), c), "text-amber-400"]].map(([l, v, cl]) => (<div key={l as string} className="flex justify-between text-sm"><span className="text-gray-400">{l as string}</span><span className={`font-bold ${cl as string}`}>{v as string}</span></div>))}<BarFill value={qColl} max={s.quarterlyGoal.target} color="#3B82F6" h={8} /></div></div></Card>
-        <Card className="lg:col-span-2"><p className="text-xs text-gray-500 uppercase tracking-wider mb-4">Datos Financieros Base</p><div className="grid grid-cols-2 md:grid-cols-4 gap-3">{([["💰 Efectivo", "cash"], ["⏳ Por cobrar", "receivable"], ["💳 Deuda total", "totalDebt"], ["📉 Gasto mensual", "monthlyExpense"]] as [string, keyof typeof s.finance][]).map(([label, key]) => (<div key={key}><label className="text-xs text-gray-500 mb-1.5 block">{label}</label><input type="number" defaultValue={s.finance[key]} onBlur={e => set({ ...s, finance: { ...s.finance, [key]: Number(e.target.value) } })} className="w-full bg-[#0D0D12] border border-white/10 text-white rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-[#9D4EDD]/60" /></div>))}</div></Card>
+        <Card><p className="text-xs text-gray-500 uppercase tracking-wider mb-4">Meta Mensual</p><div className="space-y-3"><div><label className="text-xs text-gray-500 mb-1.5 block">Meta mensual ({c})</label><input type="number" value={s.monthlyGoal.target} onChange={e => set({ ...s, monthlyGoal: { target: Number(e.target.value) } })} className="w-full bg-[#0D0D12] border border-white/10 text-white rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-[#9D4EDD]/60" /></div><div className="bg-[#0D0D12] rounded-xl p-4 border border-white/5 space-y-2">{[["Cobrado este mes", fmtExact(mColl, c), "text-emerald-400"], ["Meta", fmtExact(s.monthlyGoal.target, c), "text-white"], ["Faltante", fmtExact(Math.max(0, s.monthlyGoal.target - mColl), c), "text-amber-400"]].map(([l, v, cl]) => (<div key={l as string} className="flex justify-between text-sm"><span className="text-gray-400">{l as string}</span><span className={`font-bold ${cl as string}`}>{v as string}</span></div>))}<BarFill value={mColl} max={s.monthlyGoal.target} color="#9D4EDD" h={8} /></div></div></Card>
+        <Card><p className="text-xs text-gray-500 uppercase tracking-wider mb-4">Meta Trimestral Q{q} · {qMo[q]}</p><div className="space-y-3"><div><label className="text-xs text-gray-500 mb-1.5 block">Meta Q{q} ({c})</label><input type="number" value={s.quarterlyGoal.target} onChange={e => set({ ...s, quarterlyGoal: { target: Number(e.target.value) } })} className="w-full bg-[#0D0D12] border border-white/10 text-white rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-[#9D4EDD]/60" /></div><div className="bg-[#0D0D12] rounded-xl p-4 border border-white/5 space-y-2">{[["Cobrado Q" + q, fmtExact(qColl, c), "text-blue-400"], ["Meta", fmtExact(s.quarterlyGoal.target, c), "text-white"], ["Faltante", fmtExact(Math.max(0, s.quarterlyGoal.target - qColl), c), "text-amber-400"]].map(([l, v, cl]) => (<div key={l as string} className="flex justify-between text-sm"><span className="text-gray-400">{l as string}</span><span className={`font-bold ${cl as string}`}>{v as string}</span></div>))}<BarFill value={qColl} max={s.quarterlyGoal.target} color="#3B82F6" h={8} /></div></div></Card>
+        <Card className="lg:col-span-2">
+          <p className="text-xs text-gray-500 uppercase tracking-wider mb-4">Base Financiera</p>
+          {/* Capa automática (derivada) */}
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
+            {[
+              { l: "Flujo disponible", v: fmtExact(flujoDisponible(s), c), color: "text-emerald-400", tip: "Saldo manual actual (finance.cash). No incluye por cobrar ni el total líquido calculado." },
+              { l: "Efectivo cobrado (auto)", v: fmtExact(efectivoCobradoAuto(s), c), color: "text-white", tip: "Suma de ingresos/abonos efectivamente cobrados (automático; cada abono se cuenta una sola vez)." },
+              { l: "Flujo por cobrar (auto)", v: fmtExact(flujoPorCobrar(s), c), color: "text-amber-400", tip: "Saldos pendientes de ingresos/comisiones Por cobrar (automático)." },
+              { l: "Deuda total (auto)", v: fmtExact(deudaTotalAuto(s), c), color: "text-red-400", tip: "Suma de saldos pendientes de deudas que debes (automático)." },
+            ].map(x => (
+              <div key={x.l} className="bg-[#0D0D12] rounded-xl p-3 border border-white/5" title={x.tip}>
+                <p className="text-[11px] text-gray-500 mb-1">{x.l}</p>
+                <p className={`font-bold text-sm ${x.color}`}>{x.v}</p>
+              </div>
+            ))}
+          </div>
+          {/* Total líquido calculado (vista derivada) */}
+          <div className="bg-[#0D0D12] rounded-xl p-3 border border-white/5 mb-4" title="Efectivo cobrado (auto) + ajustes manuales. Vista derivada; NO sustituye ni se suma al saldo manual (finance.cash).">
+            <p className="text-[11px] text-gray-500 mb-1">Total líquido calculado <span className="text-gray-600">= efectivo cobrado (auto) + ajustes manuales</span></p>
+            <p className="text-lg font-black text-[#c084fc]">{fmtExact(totalLiquidoCalculado(s), c)}</p>
+          </div>
+          {/* Ajustes manuales (capa auditable) */}
+          <div className="mb-4">
+            <div className="flex items-center justify-between mb-2">
+              <p className="text-[11px] text-gray-500 uppercase tracking-wider">Ajustes manuales <span className="text-gray-600 normal-case">({fmtExact(ajustesManualesSum(s), c)})</span></p>
+              <button onClick={() => { setEditingAdj(null); setAdjForm({ amount: "", date: today(), reason: "", note: "" }); setShowAdjForm(!showAdjForm); }} className="text-xs text-[#c084fc] hover:text-[#9D4EDD]"><Plus size={12} /> Ajuste</button>
+            </div>
+            {adjMsg && <p className="text-[11px] text-gray-400 mb-2">{adjMsg}</p>}
+            {showAdjForm && (
+              <div className="bg-[#0D0D12] rounded-xl p-3 border border-white/5 mb-2 space-y-2">
+                <div className="grid grid-cols-2 gap-2">
+                  <input type="number" value={adjForm.amount} onChange={e => setAdjForm({ ...adjForm, amount: e.target.value })} placeholder="Monto (+/-)" className="bg-[#16161F] border border-white/10 text-white rounded-xl px-3 py-2 text-sm placeholder-gray-700 focus:outline-none" aria-label="Monto del ajuste" />
+                  <input type="date" value={adjForm.date} onChange={e => setAdjForm({ ...adjForm, date: e.target.value })} className="bg-[#16161F] border border-white/10 text-white rounded-xl px-3 py-2 text-sm focus:outline-none" aria-label="Fecha del ajuste" />
+                </div>
+                <input value={adjForm.reason} onChange={e => setAdjForm({ ...adjForm, reason: e.target.value })} placeholder="Motivo (obligatorio)" className="w-full bg-[#16161F] border border-white/10 text-white rounded-xl px-3 py-2 text-sm placeholder-gray-700 focus:outline-none" aria-label="Motivo del ajuste" />
+                <input value={adjForm.note} onChange={e => setAdjForm({ ...adjForm, note: e.target.value })} placeholder="Nota (opcional)" className="w-full bg-[#16161F] border border-white/10 text-white rounded-xl px-3 py-2 text-sm placeholder-gray-700 focus:outline-none" aria-label="Nota del ajuste" />
+                <div className="flex gap-2">
+                  <button onClick={saveAdjustment} className="px-3 py-1.5 bg-[#9D4EDD] text-white rounded-xl text-xs hover:bg-[#7B2CBF]">{editingAdj ? "Guardar cambios" : "Registrar"}</button>
+                  <button onClick={() => { setShowAdjForm(false); setEditingAdj(null); }} className="px-3 py-1.5 bg-white/5 text-gray-400 rounded-xl text-xs">Cancelar</button>
+                </div>
+              </div>
+            )}
+            {(s.financeAdjustments || []).length === 0 && <p className="text-[11px] text-gray-600">Sin ajustes manuales. Sirven para conciliar (ej. dinero cobrado ya gastado) sin tocar los cálculos automáticos.</p>}
+            {(s.financeAdjustments || []).slice().reverse().slice(0, 12).map(a => (
+              <div key={a.id} className={`flex items-center gap-2 text-xs py-1.5 border-b border-white/5 ${a.voided ? "opacity-50" : ""}`}>
+                <span className="text-gray-500 w-20">{a.date}</span>
+                <span className={`font-bold ${a.voided ? "text-gray-500" : Number(a.amount) < 0 ? "text-red-400" : "text-emerald-400"}`}>{a.voided ? "Anulado" : `${Number(a.amount) < 0 ? "−" : "+"}${fmtExact(Math.abs(Number(a.amount)), c)}`}</span>
+                <span className="text-gray-400 truncate flex-1">{a.reason}{a.note ? ` · ${a.note}` : ""}</span>
+                {!a.voided && (<>
+                  <button onClick={() => { setEditingAdj(a); setAdjForm({ amount: String(a.amount), date: a.date, reason: a.reason, note: a.note || "" }); setShowAdjForm(true); }} className="text-gray-600 hover:text-[#c084fc]" aria-label="Editar ajuste"><Pencil size={11} /></button>
+                  <button onClick={() => setConfirmVoidAdj(a)} className="text-gray-600 hover:text-amber-400" aria-label="Anular ajuste">Anular</button>
+                </>)}
+              </div>
+            ))}
+          </div>
+          {/* Datos manuales (legacy, compatibilidad) */}
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+            {([["💰 Flujo disponible (manual)", "cash", "Saldo manual actual (finance.cash)."],
+              ["⏳ Por cobrar (manual histórico)", "receivable", "Dato manual histórico; la métrica derivada usa ingresos Por cobrar."],
+              ["💳 Deuda total (manual histórico)", "totalDebt", "Dato manual histórico; la métrica derivada usa saldos de deudas."],
+              ["📉 Gasto mensual (manual)", "monthlyExpense", "Gasto mensual manual (base del colchón)."]] as [string, keyof typeof s.finance, string][]).map(([label, key, tip]) => (
+              <div key={key} title={tip}>
+                <label className="text-xs text-gray-500 mb-1.5 block">{label}</label>
+                <input type="number" value={s.finance[key]} onChange={e => set({ ...s, finance: { ...s.finance, [key]: Number(e.target.value) } })} className="w-full bg-[#0D0D12] border border-white/10 text-white rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-[#9D4EDD]/60" aria-label={label} />
+              </div>
+            ))}
+          </div>
+        </Card>
       </div>)}
 
       {showForm && sec === "income" && (<Card>
@@ -1410,6 +1677,7 @@ function MoneyTab({ s, set, hideAmounts, onToggleHide, onMutateIncomes }: { s: A
           <Inp label="Monto total acordado" type="number" value={ni.amount} onChange={v => setNi({ ...ni, amount: v })} placeholder="0" />
           <Inp label="Abono inicial (opcional)" type="number" value={ni.initialPayment} onChange={v => setNi({ ...ni, initialPayment: v })} placeholder="0" />
           <Inp label="Fecha estimada de cobro (opcional)" type="date" value={ni.expectedDate} onChange={v => setNi({ ...ni, expectedDate: v })} />
+          <Inp label="Notas (opcional)" value={ni.notes} onChange={v => setNi({ ...ni, notes: v })} placeholder="Referencia, cliente, detalle..." full />
           <div><label className="text-xs text-gray-500 mb-1.5 block">Fuente / Negocio</label><select value={ni.source} onChange={e => setNi({ ...ni, source: e.target.value })} className="w-full bg-[#0D0D12] border border-white/10 text-white rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-[#9D4EDD]/60"><option value="">Seleccionar...</option>{INCOME_SRCS.map(o => <option key={o} value={o}>{o}</option>)}</select></div>
           <div><label className="text-xs text-gray-500 mb-1.5 block">Abonar a meta monetaria</label><select value={ni.goalId} onChange={e => setNi({ ...ni, goalId: e.target.value })} className="w-full bg-[#0D0D12] border border-white/10 text-white rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-[#9D4EDD]/60"><option value="">Sin abono</option>{s.goals.filter(g => g.kind === "money").map(g => <option key={g.id} value={g.id}>{g.title}</option>)}</select></div>
           <Inp label="Monto a abonar a meta" type="number" value={ni.goalAllocation} onChange={v => setNi({ ...ni, goalAllocation: v })} placeholder="0" />
@@ -1424,15 +1692,15 @@ function MoneyTab({ s, set, hideAmounts, onToggleHide, onMutateIncomes }: { s: A
             if (initial < 0 || initial > total) { setIncomeMsg({ kind: "err", text: `El abono inicial no puede exceder el monto total (${fmt(total, c)}).` }); return; }
             const goalAllocation = Number(ni.goalAllocation) || 0;
             setIncomeBusy(true); setIncomeMsg(null);
-            const inc: Income = { id: uid(), date: ni.date, type: ni.type.trim(), description: ni.description.trim(), amount: total, status: initial >= total ? "Cobrado" : "Por cobrar", source: ni.source, totalAmount: total, amountCollected: initial, paymentHistory: initial > 0 ? [{ id: uid(), date: ni.date || today(), amount: initial, note: "Abono inicial" }] : [], expectedDate: ni.expectedDate || undefined, goalId: ni.goalId, goalAllocation: String(goalAllocation) };
+            const inc: Income = { id: uid(), date: ni.date, type: ni.type.trim(), description: ni.description.trim(), amount: total, status: initial >= total ? "Cobrado" : "Por cobrar", source: ni.source, totalAmount: total, amountCollected: initial, paymentHistory: initial > 0 ? [{ id: uid(), date: ni.date || today(), amount: initial, note: "Abono inicial" }] : [], expectedDate: ni.expectedDate || undefined, notes: ni.notes.trim() || undefined, goalId: ni.goalId, goalAllocation: String(goalAllocation) };
             const ok = onMutateIncomes ? await onMutateIncomes(prev => [...prev, inc]) : false;
             setIncomeBusy(false);
             if (!ok) return;
             if (ni.goalId && goalAllocation > 0 && total >= goalAllocation) {
-              set(prev => ({ ...prev, goals: prev.goals.map(g => { if (g.id !== ni.goalId || g.kind !== "money") return g; const current = g.currentAmount ?? 0; const target = g.targetAmount ?? 0; const nextCurrent = current + goalAllocation; const progress = target > 0 ? Math.min(100, Math.round((nextCurrent / target) * 100)) : g.progress; return { ...g, currentAmount: nextCurrent, progress, status: target > 0 && nextCurrent >= target ? "completed" : "in-progress" }; }) }));
+              set(prev => ({ ...prev, goals: prev.goals.map(g => { if (g.id !== ni.goalId || g.kind !== "money") return g; const prevAcc = goalAccumulated(g); const base = g.progressHistory && g.progressHistory.length > 0 ? g.progressHistory : (prevAcc > 0 ? [{ id: uid(), date: today(), amount: prevAcc, note: "Acumulado previo (migración)" } as GoalProgressEntry] : []); const newHist = [...base, { id: uid(), date: today(), amount: goalAllocation, note: `Abono desde ingreso ${inc.description}` }]; const newCur = newHist.filter(p => !p.voided).reduce((a, p) => a + (Number(p.amount) || 0), 0); return goalRecalc({ ...g, progressHistory: newHist, currentAmount: newCur }); }) }));
             }
             setIncomeMsg({ kind: "ok", text: "Ingreso guardado." });
-            setNi({ date: today(), type: "", description: "", amount: "", initialPayment: "", expectedDate: "", source: "", goalId: "", goalAllocation: "" });
+            setNi({ date: today(), type: "", description: "", amount: "", initialPayment: "", expectedDate: "", notes: "", source: "", goalId: "", goalAllocation: "" });
             setShowForm(false);
           }} className="px-4 py-2 bg-[#9D4EDD] text-white rounded-xl text-sm font-medium hover:bg-[#7B2CBF] disabled:opacity-50">{incomeBusy ? "Guardando…" : "Guardar"}</button>
           <button onClick={() => setShowForm(false)} className="px-4 py-2 bg-white/5 text-gray-400 rounded-xl text-sm">Cancelar</button>
@@ -1496,7 +1764,7 @@ function MoneyTab({ s, set, hideAmounts, onToggleHide, onMutateIncomes }: { s: A
         </div>
         <div className="flex items-center gap-1.5 mt-2 flex-wrap">
           {isPending && <button onClick={() => { setAbonarIncome(inc); setAbono({ amount: "", date: today(), note: "" }); setIncomeMsg(null); }} className="min-h-11 inline-flex items-center justify-center gap-1 px-3 rounded-xl bg-emerald-500/15 border border-emerald-500/30 text-emerald-400 text-xs font-medium hover:bg-emerald-500/25" aria-label={`Abonar pago a ${inc.description}`}>Abonar pago</button>}
-          <button onClick={() => { setEditingIncome(inc); setEditForm({ description: inc.description, source: inc.source, type: inc.type, total: String(total), expectedDate: inc.expectedDate || "" }); setIncomeMsg(null); }} className="min-h-11 inline-flex items-center justify-center gap-1 px-3 rounded-xl bg-white/5 border border-white/10 text-gray-300 text-xs hover:text-white hover:bg-white/10" aria-label={`Editar ${inc.description}`}><Pencil size={13} /> Editar</button>
+          <button onClick={() => { setEditingIncome(inc); setEditForm({ description: inc.description, source: inc.source, type: inc.type, total: String(total), expectedDate: inc.expectedDate || "", notes: inc.notes || "" }); setIncomeMsg(null); }} className="min-h-11 inline-flex items-center justify-center gap-1 px-3 rounded-xl bg-white/5 border border-white/10 text-gray-300 text-xs hover:text-white hover:bg-white/10" aria-label={`Editar ${inc.description}`}><Pencil size={13} /> Editar</button>
           <button onClick={() => { if (onMutateIncomes) void onMutateIncomes(prev => prev.filter(i => i.id !== inc.id)).then(ok => { if (ok) setIncomeMsg({ kind: "ok", text: "Ingreso eliminado." }); }); }} className="min-h-11 inline-flex items-center justify-center px-3 rounded-xl text-gray-600 hover:text-red-400 text-xs" aria-label={`Eliminar ${inc.description}`}><Trash2 size={13} /> Eliminar</button>
           {history.length > 0 && <button onClick={() => setExpandedId(expandedId === inc.id ? null : inc.id)} className="min-h-11 inline-flex items-center justify-center px-2 rounded-xl text-gray-500 hover:text-white" aria-label="Ver historial de abonos">{expandedId === inc.id ? <ChevronUp size={14} /> : <ChevronDown size={14} />}</button>}
         </div>
@@ -1520,7 +1788,52 @@ function MoneyTab({ s, set, hideAmounts, onToggleHide, onMutateIncomes }: { s: A
 
       {sec === "expenses" && (<div className="grid grid-cols-1 lg:grid-cols-3 gap-4"><Card className="lg:col-span-2"><div className="flex flex-wrap items-center gap-2 mb-4 pb-4 border-b border-white/5"><p className="text-xs text-gray-500 uppercase tracking-wider mr-1">Reporte PDF</p>{([["week", "Semana"], ["month", "Mes"], ["quarter", "Trimestre"], ["custom", "Personalizado"]] as const).map(([id, lab]) => (<button key={id} onClick={() => setRepPeriod(id)} className={`px-3 py-1.5 rounded-xl text-xs font-medium transition-all ${repPeriod === id ? "bg-[#9D4EDD] text-white" : "bg-white/5 text-gray-400 hover:text-white"}`}>{lab}</button>))}{repPeriod === "custom" && (<><input type="date" value={repCustom.from} onChange={e => setRepCustom({ ...repCustom, from: e.target.value })} className="bg-[#0D0D12] border border-white/10 text-white rounded-xl px-2 py-1.5 text-xs" aria-label="Desde" /><input type="date" value={repCustom.to} onChange={e => setRepCustom({ ...repCustom, to: e.target.value })} className="bg-[#0D0D12] border border-white/10 text-white rounded-xl px-2 py-1.5 text-xs" aria-label="Hasta" /></>)}{repMsg && <span className="text-[11px] text-gray-500 w-full">{repMsg}</span>}<button onClick={generateReport} className="ml-auto flex items-center gap-2 px-4 py-2 rounded-xl bg-[#9D4EDD] text-white text-sm font-medium hover:bg-[#7B2CBF] min-h-11"><FileDown size={15} /> Generar reporte PDF</button></div><div className="flex items-center justify-between mb-3"><p className="text-xs text-gray-500 uppercase tracking-wider">Gastos del mes</p><span className="text-red-400 font-bold">{fmt(totalExp, c)}</span></div><div className="space-y-2">{s.expenses.map(exp => (<div key={exp.id} className="flex items-center gap-3 p-3 bg-[#0D0D12] rounded-xl border border-white/5 hover:border-white/10 transition-all"><div className="flex-1 min-w-0"><p className="text-sm text-white font-medium truncate">{exp.description}</p><div className="flex items-center gap-2 mt-0.5 flex-wrap"><p className="text-xs text-gray-600">{exp.category} · {exp.date}</p>{exp.businessCategory && <Bdg color="purple">{exp.businessCategory}</Bdg>}</div></div><span className="font-bold text-sm text-red-400">{fmt(exp.amount, c)}</span><button onClick={() => set({ ...s, expenses: s.expenses.filter(e => e.id !== exp.id) })} className="text-gray-700 hover:text-red-400"><Trash2 size={13} /></button></div>))}</div></Card><div className="space-y-4"><Card><p className="text-xs text-gray-500 uppercase tracking-wider mb-3">Por categoría</p><div className="h-36"><ResponsiveContainer width="100%" height="100%"><PieChart><Pie data={pieData} dataKey="value" nameKey="name" cx="50%" cy="50%" outerRadius={62} innerRadius={32}>{pieData.map((_, i) => <Cell key={i} fill={PIE_COLORS[i % PIE_COLORS.length]} />)}</Pie><Tooltip contentStyle={{ background: "#16161F", border: "1px solid rgba(255,255,255,0.08)", borderRadius: 10, color: "#fff", fontSize: 11 }} formatter={(v: number) => fmt(v, c)} /></PieChart></ResponsiveContainer></div><div className="space-y-1.5 mt-2 max-h-20 overflow-y-auto">{pieData.map(({ name, value }, i) => (<div key={name} className="flex items-center justify-between text-xs"><div className="flex items-center gap-2"><div className="w-2 h-2 rounded-full shrink-0" style={{ background: PIE_COLORS[i % PIE_COLORS.length] }} /><span className="text-gray-400 truncate max-w-[90px]">{name}</span></div><span className="text-gray-300">{fmt(value, c)}</span></div>))}</div></Card><Card><p className="text-xs text-gray-500 uppercase tracking-wider mb-3">Por negocio / destino</p><div className="space-y-2">{Object.entries(expByBiz).map(([name, value], i) => (<div key={name}><div className="flex justify-between text-xs mb-1"><span className="text-gray-400 truncate">{name}</span><span className="text-gray-300">{fmt(value, c)}</span></div><BarFill value={value} max={totalExp} color={PIE_COLORS[i % PIE_COLORS.length]} h={4} /></div>))}</div></Card></div></div>)}
 
-      {sec === "debts" && (<div className="space-y-3">{s.debts.length === 0 && <Card><p className="text-gray-600 text-sm text-center py-6">Sin deudas registradas</p></Card>}{s.debts.map(d => { const paid = d.originalBalance - d.balance; const dp = pct(paid, d.originalBalance); return (<Card key={d.id}><div className="flex items-start justify-between mb-3"><div><p className="text-white font-semibold">{d.name}</p>{d.targetDate && <p className="text-xs text-gray-600 mt-0.5">Objetivo: {d.targetDate}</p>}</div><div className="flex items-center gap-2"><Bdg color={dp >= 60 ? "green" : dp >= 30 ? "yellow" : "red"}>{dp}% pagado</Bdg><button onClick={() => set({ ...s, debts: s.debts.filter(x => x.id !== d.id) })} className="text-gray-700 hover:text-red-400"><Trash2 size={13} /></button></div></div><div className="flex items-center justify-between mb-3"><span className="text-2xl font-bold text-red-400">{fmt(d.balance, c)}</span><span className="text-sm text-gray-600">de {fmt(d.originalBalance, c)}</span></div><BarFill value={paid} max={d.originalBalance} color="#10B981" h={8} /><div className="grid grid-cols-2 gap-3 mt-3"><div className="bg-[#0D0D12] rounded-xl p-3 border border-white/5"><p className="text-[11px] text-gray-600">Pago mínimo</p><p className="text-sm font-bold text-white mt-0.5">{fmt(d.minPayment, c)}</p></div><div className="bg-[#0D0D12] rounded-xl p-3 border border-white/5"><p className="text-[11px] text-gray-600">Pago objetivo</p><p className="text-sm font-bold text-[#c084fc] mt-0.5">{fmt(d.targetPayment, c)}</p></div></div></Card>); })}</div>)}
+      {sec === "debts" && (<div className="space-y-3">
+        {s.debts.length === 0 && <Card><p className="text-gray-600 text-sm text-center py-6">Sin deudas registradas</p></Card>}
+        {s.debts.map(d => {
+          const paid = debtPaid(d); const saldo = debtSaldo(d); const total = Number(d.originalBalance) || Number(d.balance) || 0;
+          const st = debtStatus(d); const dp = total > 0 ? pct(paid, total) : 0;
+          const history = d.payments || [];
+          return (<Card key={d.id}>
+            <div className="flex items-start justify-between mb-3">
+              <div>
+                <p className="text-white font-semibold">{d.name}</p>
+                {(d.lender || d.category || d.targetDate || d.dueDate) && <p className="text-xs text-gray-600 mt-0.5">{[d.lender, d.category, d.targetDate ? `Objetivo: ${d.targetDate}` : null, d.dueDate ? `Vence: ${d.dueDate}` : null].filter(Boolean).join(" · ")}</p>}
+                {d.notes && <p className="text-[11px] text-gray-600 mt-0.5">{d.notes}</p>}
+              </div>
+              <div className="flex items-center gap-2">
+                <Bdg color={st === "Liquidada" ? "green" : dp >= 60 ? "yellow" : "red"}>{st === "Liquidada" ? "Liquidada" : `${dp}% pagado`}</Bdg>
+                <button onClick={() => set({ ...s, debts: s.debts.filter(x => x.id !== d.id) })} className="text-gray-700 hover:text-red-400" aria-label={`Eliminar ${d.name}`}><Trash2 size={13} /></button>
+              </div>
+            </div>
+            <div className="flex items-center justify-between mb-3">
+              <div><span className="text-2xl font-bold text-red-400">{fmtExact(saldo, c)}</span><span className="text-sm text-gray-600"> saldo pendiente</span></div>
+              <span className="text-sm text-gray-600">de {fmtExact(total, c)} · abonado {fmtExact(paid, c)}</span>
+            </div>
+            <BarFill value={paid} max={total || 1} color="#10B981" h={8} />
+            <div className="flex items-center gap-2 mt-3 flex-wrap">
+              {st !== "Liquidada" && <button onClick={() => { setAbonarDebt(d); setAbonoDebt({ amount: "", date: today(), note: "" }); setDebtMsg(null); }} className="min-h-11 inline-flex items-center justify-center gap-1 px-3 rounded-xl bg-emerald-500/15 border border-emerald-500/30 text-emerald-400 text-xs font-medium hover:bg-emerald-500/25" aria-label={`Abonar a ${d.name}`}>Abonar pago</button>}
+              <button onClick={() => { setEditingDebt(d); setEditDebtForm({ name: d.name, lender: d.lender || "", category: d.category || "", notes: d.notes || "", originalBalance: String(total), balance: String(saldo), minPayment: String(d.minPayment || 0), targetPayment: String(d.targetPayment || 0), targetDate: d.targetDate || "", dueDate: d.dueDate || "" }); setDebtMsg(null); }} className="min-h-11 inline-flex items-center justify-center gap-1 px-3 rounded-xl bg-white/5 border border-white/10 text-gray-300 text-xs hover:text-white hover:bg-white/10" aria-label={`Editar ${d.name}`}><Pencil size={13} /> Editar</button>
+              <button onClick={() => { if (onMutateDebts) void onMutateDebts(prev => prev.filter(x => x.id !== d.id)).then(ok => { if (ok) setDebtMsg({ kind: "ok", text: "Deuda eliminada." }); }); }} className="min-h-11 inline-flex items-center justify-center px-3 rounded-xl text-gray-600 hover:text-red-400 text-xs" aria-label={`Eliminar ${d.name}`}><Trash2 size={13} /> Eliminar</button>
+              {history.length > 0 && <button onClick={() => setExpandedDebtId(expandedDebtId === d.id ? null : d.id)} className="min-h-11 inline-flex items-center justify-center px-2 rounded-xl text-gray-500 hover:text-white" aria-label="Ver historial de abonos">{expandedDebtId === d.id ? <ChevronUp size={14} /> : <ChevronDown size={14} />}</button>}
+            </div>
+            {debtMsg && <p className={`text-xs px-3 py-2 rounded-xl mt-3 ${debtMsg.kind === "ok" ? "text-emerald-400 bg-emerald-500/10 border border-emerald-500/20" : "text-red-400 bg-red-500/10 border border-red-500/20"}`}>{debtMsg.text}</p>}
+            {expandedDebtId === d.id && history.length > 0 && (
+              <div className="mt-3 pt-3 border-t border-white/5 space-y-2">
+                <p className="text-[11px] text-gray-500 uppercase tracking-wider">Historial de abonos</p>
+                {history.map(p => (
+                  <div key={p.id} className={`flex items-center gap-2 text-xs flex-wrap ${p.voided ? "opacity-50" : ""}`}>
+                    <span className="text-gray-500">{p.date}</span>
+                    <span className="text-emerald-400 font-bold">{fmtExact(p.amount, c)}</span>
+                    {p.note && <span className="text-gray-500 truncate flex-1">{p.note}</span>}
+                    {p.voided ? <Bdg color="gray">Anulado</Bdg> : <button onClick={() => { setConfirmAnularAbono({ debt: d, payment: p }); setDebtMsg(null); }} className="text-[11px] px-2 py-1 rounded-lg border border-white/10 text-gray-500 hover:text-amber-400" aria-label={`Anular abono ${fmtExact(p.amount, c)}`}>Anular</button>}
+                  </div>
+                ))}
+              </div>
+            )}
+          </Card>);
+        })}
+      </div>)}
 
       {/* ── Modales de ingresos (Objetivo 1) ─────────────────────────────────── */}
       {editingIncome && (
@@ -1533,6 +1846,7 @@ function MoneyTab({ s, set, hideAmounts, onToggleHide, onMutateIncomes }: { s: A
               <div><label className="text-xs text-gray-500 mb-1.5 block">Fuente / Negocio</label><select value={editForm.source} onChange={e => setEditForm({ ...editForm, source: e.target.value })} className="w-full bg-[#0D0D12] border border-white/10 text-white rounded-xl px-3 py-2.5 text-sm"><option value="">Seleccionar...</option>{INCOME_SRCS.map(o => <option key={o} value={o}>{o}</option>)}</select></div>
               <Inp label="Monto total acordado" type="number" value={editForm.total} onChange={v => setEditForm({ ...editForm, total: v })} placeholder="0" />
               <Inp label="Fecha estimada de cobro (opcional)" type="date" value={editForm.expectedDate} onChange={v => setEditForm({ ...editForm, expectedDate: v })} />
+              <Inp label="Notas (opcional)" value={editForm.notes} onChange={v => setEditForm({ ...editForm, notes: v })} full />
             </div>
             <div className="mt-4 p-3 bg-[#0D0D12] rounded-xl border border-white/5 text-xs text-gray-500 space-y-1">
               <p>Ya cobrado: <b className="text-emerald-400">{fmt(incomeCollected(editingIncome), c)}</b> · Saldo pendiente: <b className="text-amber-400">{fmt(incomePending(editingIncome), c)}</b></p>
@@ -1546,7 +1860,7 @@ function MoneyTab({ s, set, hideAmounts, onToggleHide, onMutateIncomes }: { s: A
                 const paid = incomeCollected(editingIncome);
                 if (total < paid) { setIncomeMsg({ kind: "err", text: `El monto total no puede ser menor a lo ya cobrado (${fmt(paid, c)}).` }); return; }
                 setIncomeBusy(true); setIncomeMsg(null);
-                const ok = onMutateIncomes ? await onMutateIncomes(prev => prev.map(x => x.id === editingIncome.id ? recomputeIncome({ ...x, description: editForm.description.trim(), type: editForm.type.trim(), source: editForm.source, totalAmount: total, amount: total, expectedDate: editForm.expectedDate || undefined }) : x)) : false;
+                const ok = onMutateIncomes ? await onMutateIncomes(prev => prev.map(x => x.id === editingIncome.id ? recomputeIncome({ ...x, description: editForm.description.trim(), type: editForm.type.trim(), source: editForm.source, totalAmount: total, amount: total, expectedDate: editForm.expectedDate || undefined, notes: editForm.notes.trim() || undefined }) : x)) : false;
                 setIncomeBusy(false);
                 if (ok) { setIncomeMsg({ kind: "ok", text: "Ingreso actualizado." }); setEditingIncome(null); }
               }} className="px-4 py-2 bg-[#9D4EDD] text-white rounded-xl text-sm font-medium hover:bg-[#7B2CBF] disabled:opacity-50">{incomeBusy ? "Guardando…" : "Guardar cambios"}</button>
@@ -1623,6 +1937,102 @@ function MoneyTab({ s, set, hideAmounts, onToggleHide, onMutateIncomes }: { s: A
         </div>
       )}
 
+      {/* ── Modales de deudas (FASE 2) ──────────────────────────────────────── */}
+      {editingDebt && (
+        <div className="fixed inset-0 z-50 bg-black/70 flex items-start justify-center pt-16 px-4 overflow-y-auto pb-10" onClick={() => setEditingDebt(null)}>
+          <div className="w-full max-w-md bg-[#16161F] border border-white/10 rounded-2xl p-5 shadow-2xl" onClick={e => e.stopPropagation()}>
+            <div className="flex items-center justify-between mb-4"><p className="text-white font-bold">Editar deuda</p><button onClick={() => setEditingDebt(null)} className="text-gray-500 hover:text-white" aria-label="Cerrar"><X size={16} /></button></div>
+            <div className="grid grid-cols-2 gap-3">
+              <Inp label="Título / concepto" value={editDebtForm.name} onChange={v => setEditDebtForm({ ...editDebtForm, name: v })} full />
+              <Inp label="Acreedor / origen" value={editDebtForm.lender} onChange={v => setEditDebtForm({ ...editDebtForm, lender: v })} placeholder="Banco, persona, institución..." />
+              <Inp label="Categoría" value={editDebtForm.category} onChange={v => setEditDebtForm({ ...editDebtForm, category: v })} placeholder="Tarjeta, préstamo, auto..." />
+              <Inp label="Monto original" type="number" value={editDebtForm.originalBalance} onChange={v => setEditDebtForm({ ...editDebtForm, originalBalance: v })} placeholder="0" />
+              <Inp label="Pago mínimo" type="number" value={editDebtForm.minPayment} onChange={v => setEditDebtForm({ ...editDebtForm, minPayment: v })} placeholder="0" />
+              <Inp label="Pago objetivo" type="number" value={editDebtForm.targetPayment} onChange={v => setEditDebtForm({ ...editDebtForm, targetPayment: v })} placeholder="0" />
+              <Inp label="Fecha objetivo" type="date" value={editDebtForm.targetDate} onChange={v => setEditDebtForm({ ...editDebtForm, targetDate: v })} />
+              <Inp label="Fecha de vencimiento (opcional)" type="date" value={editDebtForm.dueDate} onChange={v => setEditDebtForm({ ...editDebtForm, dueDate: v })} />
+              <Inp label="Notas" value={editDebtForm.notes} onChange={v => setEditDebtForm({ ...editDebtForm, notes: v })} full />
+            </div>
+            <div className="mt-4 p-3 bg-[#0D0D12] rounded-xl border border-white/5 text-xs text-gray-500 space-y-1">
+              <p>Abonado: <b className="text-emerald-400">{fmtExact(debtPaid(editingDebt), c)}</b> · Saldo: <b className="text-amber-400">{fmtExact(debtSaldo(editingDebt), c)}</b></p>
+              <p>El monto original no puede ser menor a lo ya abonado.</p>
+            </div>
+            {debtMsg && <p className={`text-xs px-3 py-2 rounded-xl mt-3 ${debtMsg.kind === "ok" ? "text-emerald-400 bg-emerald-500/10 border border-emerald-500/20" : "text-red-400 bg-red-500/10 border border-red-500/20"}`}>{debtMsg.text}</p>}
+            <div className="flex gap-2 mt-4">
+              <button disabled={debtBusy} onClick={saveDebtEdit} className="px-4 py-2 bg-[#9D4EDD] text-white rounded-xl text-sm font-medium hover:bg-[#7B2CBF] disabled:opacity-50">{debtBusy ? "Guardando…" : "Guardar cambios"}</button>
+              <button onClick={() => setEditingDebt(null)} className="px-4 py-2 bg-white/5 text-gray-400 rounded-xl text-sm">Cancelar</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {abonarDebt && (
+        <div className="fixed inset-0 z-50 bg-black/70 flex items-start justify-center pt-16 px-4 overflow-y-auto pb-10" onClick={() => setAbonarDebt(null)}>
+          <div className="w-full max-w-md bg-[#16161F] border border-white/10 rounded-2xl p-5 shadow-2xl" onClick={e => e.stopPropagation()}>
+            <div className="flex items-center justify-between mb-4"><p className="text-white font-bold">Abonar a deuda</p><button onClick={() => setAbonarDebt(null)} className="text-gray-500 hover:text-white" aria-label="Cerrar"><X size={16} /></button></div>
+            <div className="bg-[#0D0D12] rounded-xl p-3 border border-white/5 mb-4 text-xs text-gray-500 space-y-1">
+              <p className="text-white font-medium truncate">{abonarDebt.name}</p>
+              <p>Original: <b className="text-white">{fmtExact(Number(abonarDebt.originalBalance) || Number(abonarDebt.balance) || 0, c)}</b> · Abonado: <b className="text-emerald-400">{fmtExact(debtPaid(abonarDebt), c)}</b> · Saldo: <b className="text-amber-400">{fmtExact(debtSaldo(abonarDebt), c)}</b></p>
+            </div>
+            <div className="space-y-3">
+              <Inp label="Monto del abono" type="number" value={abonoDebt.amount} onChange={v => setAbonoDebt({ ...abonoDebt, amount: v })} placeholder="0" />
+              <Inp label="Fecha" type="date" value={abonoDebt.date} onChange={v => setAbonoDebt({ ...abonoDebt, date: v })} />
+              <Inp label="Nota (opcional)" value={abonoDebt.note} onChange={v => setAbonoDebt({ ...abonoDebt, note: v })} placeholder="Referencia..." />
+            </div>
+            {debtMsg && <p className={`text-xs px-3 py-2 rounded-xl mt-3 ${debtMsg.kind === "ok" ? "text-emerald-400 bg-emerald-500/10 border border-emerald-500/20" : "text-red-400 bg-red-500/10 border border-red-500/20"}`}>{debtMsg.text}</p>}
+            <div className="flex gap-2 mt-4">
+              <button disabled={debtBusy} onClick={() => saveDebtAbono(abonarDebt)} className="px-4 py-2 bg-emerald-500 text-black rounded-xl text-sm font-medium hover:bg-emerald-400 disabled:opacity-50">{debtBusy ? "Guardando…" : "Registrar abono"}</button>
+              <button onClick={() => setAbonarDebt(null)} className="px-4 py-2 bg-white/5 text-gray-400 rounded-xl text-sm">Cancelar</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {confirmDebtExcedente && (
+        <div className="fixed inset-0 z-[60] bg-black/80 flex items-center justify-center px-4">
+          <div className="w-full max-w-sm bg-[#16161F] border border-amber-500/25 rounded-2xl p-5 shadow-2xl">
+            <p className="text-white font-bold mb-2">Abono mayor al saldo pendiente</p>
+            <p className="text-sm text-gray-400 mb-3">El abono de <b className="text-white">{fmtExact(confirmDebtExcedente.amount, c)}</b> supera el saldo pendiente de <b className="text-white">{fmtExact(debtSaldo(confirmDebtExcedente.debt), c)}</b> por <b className="text-amber-400">{fmtExact(confirmDebtExcedente.excedente, c)}</b>. Esto liquidará la deuda y dejará un excedente. ¿Continuar?</p>
+            <div className="flex gap-2">
+              <button disabled={debtBusy} onClick={async () => {
+                setDebtBusy(true); setDebtMsg(null);
+                const ok = onMutateDebts ? await onMutateDebts(prev => prev.map(x => x.id === confirmDebtExcedente.debt.id ? recomputeDebt({ ...x, payments: [...(x.payments || []), { id: uid(), date: confirmDebtExcedente.date, amount: confirmDebtExcedente.amount, note: (confirmDebtExcedente.note || `Excedente de ${fmtExact(confirmDebtExcedente.excedente, c)}`).trim() }] }) : x)) : false;
+                setDebtBusy(false);
+                if (ok) { setDebtMsg({ kind: "ok", text: "Abono registrado. Deuda liquidada." }); setConfirmDebtExcedente(null); setAbonarDebt(null); }
+              }} className="px-4 py-2 bg-amber-500 text-black rounded-xl text-sm font-medium hover:bg-amber-400 disabled:opacity-50">{debtBusy ? "Guardando…" : "Sí, registrar"}</button>
+              <button onClick={() => setConfirmDebtExcedente(null)} className="px-4 py-2 bg-white/5 text-gray-400 rounded-xl text-sm">Cancelar</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {confirmAnularAbono && (
+        <div className="fixed inset-0 z-[60] bg-black/80 flex items-center justify-center px-4">
+          <div className="w-full max-w-sm bg-[#16161F] border border-red-500/25 rounded-2xl p-5 shadow-2xl">
+            <p className="text-white font-bold mb-2">Anular abono</p>
+            <p className="text-sm text-gray-400 mb-3">Se marcará como <b className="text-red-400">anulado</b> (con auditoría) el abono de <b className="text-white">{fmtExact(confirmAnularAbono.payment.amount, c)}</b> de <b className="text-white">{confirmAnularAbono.debt.name}</b>. El saldo pendiente volverá a aumentar. ¿Continuar?</p>
+            <div className="flex gap-2">
+              <button disabled={debtBusy} onClick={anularDebtAbono} className="px-4 py-2 bg-red-500 text-black rounded-xl text-sm font-medium hover:bg-red-400 disabled:opacity-50">{debtBusy ? "Guardando…" : "Sí, anular"}</button>
+              <button onClick={() => setConfirmAnularAbono(null)} className="px-4 py-2 bg-white/5 text-gray-400 rounded-xl text-sm">Cancelar</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Confirmación anular ajuste manual (FASE 3) ─────────────────────────── */}
+      {confirmVoidAdj && (
+        <div className="fixed inset-0 z-[60] bg-black/80 flex items-center justify-center px-4">
+          <div className="w-full max-w-sm bg-[#16161F] border border-amber-500/25 rounded-2xl p-5 shadow-2xl">
+            <p className="text-white font-bold mb-2">Anular ajuste manual</p>
+            <p className="text-sm text-gray-400 mb-3">Se marcará como <b className="text-amber-400">anulado</b> (con auditoría) el ajuste de <b className="text-white">{fmtExact(confirmVoidAdj.amount, c)}</b> ({confirmVoidAdj.reason}). No se elimina físicamente; deja de contar en el Total líquido calculado. ¿Continuar?</p>
+            <div className="flex gap-2">
+              <button onClick={() => { const now = new Date().toISOString(); set({ ...s, financeAdjustments: (s.financeAdjustments || []).map(a => a.id === confirmVoidAdj.id ? { ...a, voided: true, voidedAt: now } : a) }); setAdjMsg("Ajuste anulado."); setConfirmVoidAdj(null); }} className="px-4 py-2 bg-amber-500 text-black rounded-xl text-sm font-medium hover:bg-amber-400">Sí, anular</button>
+              <button onClick={() => setConfirmVoidAdj(null)} className="px-4 py-2 bg-white/5 text-gray-400 rounded-xl text-sm">Cancelar</button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* ── Gastos Recurrentes ─────────────────────────────────────────────── */}
       {sec === "recurrentes" && (
         <div className="space-y-4">
@@ -1637,7 +2047,7 @@ function MoneyTab({ s, set, hideAmounts, onToggleHide, onMutateIncomes }: { s: A
             <div className="bg-[#0D0D12] rounded-xl p-4 border border-white/5 mb-4">
               <p className="text-xs text-gray-500 mb-2">Gasto mensual fijo configurado (para cálculo del dashboard)</p>
               <div className="flex items-center gap-3">
-                <input type="number" defaultValue={s.monthlyFixedExpense || s.finance.monthlyExpense} onBlur={e => set({ ...s, monthlyFixedExpense: Number(e.target.value), finance: { ...s.finance, monthlyExpense: Number(e.target.value) } })}
+                <input type="number" value={s.monthlyFixedExpense || s.finance.monthlyExpense} onChange={e => set({ ...s, monthlyFixedExpense: Number(e.target.value), finance: { ...s.finance, monthlyExpense: Number(e.target.value) } })}
                   className="flex-1 bg-[#16161F] border border-white/10 text-white rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-[#9D4EDD]/60" />
                 <span className="text-xs text-gray-500">{c}/mes</span>
               </div>
@@ -1686,6 +2096,11 @@ function CapitalTab({ s, set, hideAmounts, onToggleHide }: { s: AppState; set: (
   const [abonarId, setAbonarId] = useState<string | null>(null);
   const [abonarAmt, setAbonarAmt] = useState("");
   const [ng, setNg] = useState({ title: "", type: "annual" as "annual" | "quarterly", targetAmount: "", kind: "money" as GoalKind, category: "dinero" as GoalCategory });
+  // FASE B — edición completa de metas + historial de avances (anulación auditada).
+  const [editingGoal, setEditingGoal] = useState<Goal | null>(null);
+  const [goalEditErr, setGoalEditErr] = useState<string | null>(null);
+  const [expandedGoalId, setExpandedGoalId] = useState<string | null>(null);
+  const [confirmVoidAvance, setConfirmVoidAvance] = useState<{ g: Goal; p: GoalProgressEntry } | null>(null);
 
   const funds = [
     { key: "emergencyFund" as const, label: "🛟 Emergencia", color: "#10B981" },
@@ -1724,13 +2139,46 @@ function CapitalTab({ s, set, hideAmounts, onToggleHide }: { s: AppState; set: (
     set({
       ...s, goals: s.goals.map(g => {
         if (g.id !== gId) return g;
-        const newCur = (g.currentAmount ?? 0) + amt;
-        const newPct = g.targetAmount ? pct(newCur, g.targetAmount) : g.progress;
-        return { ...g, currentAmount: newCur, progress: Math.min(100, newPct), status: newPct >= 100 ? "completed" : "in-progress", completedAt: newPct >= 100 ? today() : undefined };
+        // Historial de avances: si la meta era histórica sin historial, se siembra el
+        // acumulado previo (migración) y NUNCA se borra nada: los abonos se anulan.
+        const prev = goalAccumulated(g);
+        const base = g.progressHistory && g.progressHistory.length > 0
+          ? g.progressHistory
+          : (prev > 0 ? [{ id: uid(), date: today(), amount: prev, note: "Acumulado previo (migración)" } as GoalProgressEntry] : []);
+        const newHist = [...base, { id: uid(), date: today(), amount: amt }];
+        const newCur = newHist.filter(p => !p.voided).reduce((a, p) => a + (Number(p.amount) || 0), 0);
+        return goalRecalc({ ...g, progressHistory: newHist, currentAmount: newCur });
       })
     });
     setAbonarId(null); setAbonarAmt("");
     setTimeout(() => { abonandoRef.current = false; }, 400);
+  };
+
+  const startEditGoal = (g: Goal) => { setGoalEditErr(null); setEditingGoal({ ...g }); };
+  const saveGoalEdit = () => {
+    if (!editingGoal) return;
+    const eg = editingGoal;
+    if (!eg.title.trim()) { setGoalEditErr("El título es obligatorio."); return; }
+    if (eg.kind === "money" && eg.targetAmount && eg.targetAmount > 0) {
+      const acc = goalAccumulated(eg);
+      if (eg.targetAmount < acc) { setGoalEditErr(`La meta no puede ser menor al avance ya registrado (${fmtExact(acc, c)}).`); return; }
+    }
+    // Guardar sin tocar avance acumulado ni historial; solo recalcula progreso/estado.
+    const next = goalRecalc(eg);
+    set({ ...s, goals: s.goals.map(x => x.id === next.id ? next : x) });
+    setEditingGoal(null); setGoalEditErr(null);
+  };
+  const anularAvance = (gId: string, pId: string) => {
+    const now = new Date().toISOString();
+    set({
+      ...s, goals: s.goals.map(g => {
+        if (g.id !== gId) return g;
+        const newHist = (g.progressHistory || []).map(p => p.id === pId ? { ...p, voided: true, voidedAt: now } : p);
+        const newCur = newHist.filter(p => !p.voided).reduce((a, p) => a + (Number(p.amount) || 0), 0);
+        return goalRecalc({ ...g, progressHistory: newHist, currentAmount: newCur });
+      })
+    });
+    setConfirmVoidAvance(null);
   };
 
   const ic = "w-full bg-[#0D0D12] border border-white/10 text-white rounded-xl px-2 py-1.5 text-xs focus:outline-none";
@@ -1752,8 +2200,8 @@ function CapitalTab({ s, set, hideAmounts, onToggleHide }: { s: AppState; set: (
                 <span className="font-bold text-sm" style={{ color }}>{p}%</span>
               </div>
               <div className="grid grid-cols-2 gap-2">
-                <div><label className="text-[11px] text-gray-600 block mb-1">Actual ({c})</label><input type="number" defaultValue={fund.current} onBlur={e => set({ ...s, [key]: { ...fund, current: Number(e.target.value) } })} className={ic} /></div>
-                <div><label className="text-[11px] text-gray-600 block mb-1">Meta ({c})</label><input type="number" defaultValue={fund.target} onBlur={e => set({ ...s, [key]: { ...fund, target: Number(e.target.value) } })} className={ic} /></div>
+                <div><label className="text-[11px] text-gray-600 block mb-1">Actual ({c})</label><input type="number" value={fund.current} onChange={e => set({ ...s, [key]: { ...fund, current: Number(e.target.value) } })} className={ic} /></div>
+                <div><label className="text-[11px] text-gray-600 block mb-1">Meta ({c})</label><input type="number" value={fund.target} onChange={e => set({ ...s, [key]: { ...fund, target: Number(e.target.value) } })} className={ic} /></div>
               </div>
             </Card>
           );
@@ -1798,59 +2246,119 @@ function CapitalTab({ s, set, hideAmounts, onToggleHide }: { s: AppState; set: (
             const computed = goalWithProgress(g);
             const isMoney = computed.kind === "money" && computed.targetAmount;
             const isAbonar = abonarId === computed.id;
+            const acc = goalAccumulated(computed);
+            const hist = computed.progressHistory || [];
+            const editing = editingGoal && editingGoal.id === computed.id;
             return (
               <div key={computed.id} className="group">
-                <div className="flex items-center gap-3">
-                  <div className="flex-1 min-w-0">
-                    <div className="flex items-center gap-2 mb-1.5 flex-wrap">
-                      <span className="text-sm text-gray-200 truncate">{computed.title}</span>
-                      <Bdg color={computed.kind === "money" ? "green" : computed.kind === "habit" ? "blue" : "gray"}>
-                        {computed.kind === "money" ? "💰" : computed.kind === "habit" ? "🔄" : "✅"} {computed.type === "quarterly" ? "Q" : "Anual"}
-                      </Bdg>
-                      {computed.category && <Bdg color="purple">{GOAL_CATEGORIES.find(c => c.id === computed.category)?.label ?? computed.category}</Bdg>}
-                      {computed.status === "completed" && <Bdg color="green">✓ Completada</Bdg>}
+                {editing ? (
+                  <div className="bg-[#0D0D12] rounded-xl p-4 border border-[#9D4EDD]/30 space-y-3">
+                    <div className="flex items-center justify-between"><p className="text-sm font-semibold text-white">✏️ Editar meta</p><button onClick={() => { setEditingGoal(null); setGoalEditErr(null); }} className="text-gray-500 hover:text-white" aria-label="Cerrar edición"><X size={15} /></button></div>
+                    <input value={editingGoal!.title} onChange={e => setEditingGoal({ ...editingGoal!, title: e.target.value })} placeholder="Título de la meta..." className="w-full bg-[#16161F] border border-white/10 text-white rounded-xl px-3 py-2 text-sm placeholder-gray-700 focus:outline-none" />
+                    <div className="grid grid-cols-2 md:grid-cols-3 gap-2">
+                      <div><label className="text-[11px] text-gray-500 block mb-1">Período</label><select value={editingGoal!.type} onChange={e => setEditingGoal({ ...editingGoal!, type: e.target.value as "annual" | "quarterly" })} className="w-full bg-[#16161F] border border-white/10 text-white rounded-xl px-3 py-2 text-sm focus:outline-none"><option value="annual">Anual</option><option value="quarterly">Trimestral</option></select></div>
+                      <div><label className="text-[11px] text-gray-500 block mb-1">Tipo</label><select value={editingGoal!.kind} onChange={e => setEditingGoal({ ...editingGoal!, kind: e.target.value as GoalKind })} className="w-full bg-[#16161F] border border-white/10 text-white rounded-xl px-3 py-2 text-sm focus:outline-none"><option value="money">💰 Monetaria</option><option value="habit">🔄 Hábito</option><option value="task">✅ Tarea</option></select></div>
+                      <div><label className="text-[11px] text-gray-500 block mb-1">Categoría</label><select value={editingGoal!.category ?? ""} onChange={e => setEditingGoal({ ...editingGoal!, category: (e.target.value || undefined) as GoalCategory | undefined })} className="w-full bg-[#16161F] border border-white/10 text-white rounded-xl px-3 py-2 text-sm focus:outline-none"><option value="">Sin categoría</option>{GOAL_CATEGORIES.map(c => <option key={c.id} value={c.id}>{c.label}</option>)}</select></div>
+                      <div><label className="text-[11px] text-gray-500 block mb-1">Prioridad</label><select value={editingGoal!.priority ?? "media"} onChange={e => setEditingGoal({ ...editingGoal!, priority: e.target.value as "alta" | "media" | "baja" })} className="w-full bg-[#16161F] border border-white/10 text-white rounded-xl px-3 py-2 text-sm focus:outline-none"><option value="alta">🔴 Alta</option><option value="media">🟡 Media</option><option value="baja">🟢 Baja</option></select></div>
+                      <div><label className="text-[11px] text-gray-500 block mb-1">Estado</label><select value={editingGoal!.status} onChange={e => setEditingGoal({ ...editingGoal!, status: e.target.value as GoalStatus })} className="w-full bg-[#16161F] border border-white/10 text-white rounded-xl px-3 py-2 text-sm focus:outline-none"><option value="active">Activa</option><option value="in-progress">En progreso</option><option value="completed">Completada</option></select></div>
+                      {editingGoal!.kind === "money" && <div><label className="text-[11px] text-gray-500 block mb-1">Meta $</label><input type="number" value={editingGoal!.targetAmount ?? ""} onChange={e => setEditingGoal({ ...editingGoal!, targetAmount: e.target.value === "" ? undefined : Number(e.target.value) })} placeholder="0" className="w-full bg-[#16161F] border border-white/10 text-white rounded-xl px-3 py-2 text-sm focus:outline-none" /></div>}
+                      <div><label className="text-[11px] text-gray-500 block mb-1">Fecha límite</label><input type="date" value={editingGoal!.dueDate ?? ""} onChange={e => setEditingGoal({ ...editingGoal!, dueDate: e.target.value || undefined })} className="w-full bg-[#16161F] border border-white/10 text-white rounded-xl px-3 py-2 text-sm focus:outline-none" /></div>
                     </div>
-                    {isMoney && (
-                      <div className="flex items-center gap-2 text-xs text-gray-500 mb-1">
-                        <span className="text-emerald-400 font-semibold">{fmt(computed.currentAmount ?? 0, c)}</span>
-                        <span>/</span>
-                        <span className="text-gray-400">{fmt(computed.targetAmount!, c)}</span>
-                        <span className="text-gray-600">faltante: {fmt(Math.max(0, computed.targetAmount! - (computed.currentAmount ?? 0)), c)}</span>
+                    <div><label className="text-[11px] text-gray-500 block mb-1">Notas</label><input value={editingGoal!.notes ?? ""} onChange={e => setEditingGoal({ ...editingGoal!, notes: e.target.value || undefined })} placeholder="Notas (opcional)" className="w-full bg-[#16161F] border border-white/10 text-white rounded-xl px-3 py-2 text-sm placeholder-gray-700 focus:outline-none" /></div>
+                    {isMoney && <p className="text-[11px] text-gray-500">Avance acumulado actual: <span className="text-emerald-400 font-semibold">{fmtExact(acc, c)}</span> — se conserva al editar (solo puede crecer).</p>}
+                    {goalEditErr && <p className="text-xs text-red-400 bg-red-500/10 border border-red-500/20 rounded-xl px-3 py-2">{goalEditErr}</p>}
+                    <div className="flex gap-2">
+                      <button onClick={saveGoalEdit} className="px-4 py-1.5 bg-[#9D4EDD] text-white rounded-xl text-xs font-medium hover:bg-[#7B2CBF]">Guardar cambios</button>
+                      <button onClick={() => { setEditingGoal(null); setGoalEditErr(null); }} className="px-4 py-1.5 bg-white/5 text-gray-400 rounded-xl text-xs">Cancelar</button>
+                    </div>
+                  </div>
+                ) : (
+                  <>
+                    <div className="flex items-center gap-3">
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-2 mb-1.5 flex-wrap">
+                          <span className="text-sm text-gray-200 truncate">{computed.title}</span>
+                          {computed.priority && <Bdg color={computed.priority === "alta" ? "red" : computed.priority === "media" ? "yellow" : "green"}>{computed.priority === "alta" ? "🔴 Alta" : computed.priority === "media" ? "🟡 Media" : "🟢 Baja"}</Bdg>}
+                          <Bdg color={computed.kind === "money" ? "green" : computed.kind === "habit" ? "blue" : "gray"}>
+                            {computed.kind === "money" ? "💰" : computed.kind === "habit" ? "🔄" : "✅"} {computed.type === "quarterly" ? "Q" : "Anual"}
+                          </Bdg>
+                          {computed.category && <Bdg color="purple">{GOAL_CATEGORIES.find(c => c.id === computed.category)?.label ?? computed.category}</Bdg>}
+                          {computed.dueDate && <Bdg color="gray">📅 {computed.dueDate}</Bdg>}
+                          {computed.status === "completed" && <Bdg color="green">✓ Completada</Bdg>}
+                        </div>
+                        {isMoney && (
+                          <div className="flex items-center gap-2 text-xs text-gray-500 mb-1">
+                            <span className="text-emerald-400 font-semibold">{fmtExact(acc, c)}</span>
+                            <span>/</span>
+                            <span className="text-gray-400">{fmtExact(computed.targetAmount!, c)}</span>
+                            <span className="text-gray-600">faltante: {fmtExact(Math.max(0, computed.targetAmount! - acc), c)}</span>
+                          </div>
+                        )}
+                        <div className="flex items-center gap-2">
+                          <BarFill value={computed.progress} max={100} h={5} color={computed.status === "completed" ? "#10B981" : "#9D4EDD"} />
+                          <span className="text-xs text-gray-500 w-8 text-right">{computed.progress}%</span>
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-1.5 shrink-0">
+                        {isMoney && computed.status !== "completed" && (
+                          <button onClick={() => { setAbonarId(isAbonar ? null : computed.id); setAbonarAmt(""); }}
+                            className="text-xs px-2 py-1 bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 rounded-lg hover:bg-emerald-500/20">+ Abonar</button>
+                        )}
+                        {computed.kind !== "money" && computed.status !== "completed" && (
+                          <button onClick={() => { const np = Math.min(100, computed.progress + 20); set({ ...s, goals: s.goals.map(x => x.id === computed.id ? { ...x, progress: np, status: np >= 100 ? "completed" : "in-progress", completedAt: np >= 100 ? today() : undefined } : x) }); }}
+                            className="w-6 h-6 rounded-lg bg-white/5 flex items-center justify-center text-gray-400 hover:text-white text-[10px] opacity-0 group-hover:opacity-100">+</button>
+                        )}
+                        {hist.length > 0 && (
+                          <button onClick={() => setExpandedGoalId(expandedGoalId === computed.id ? null : computed.id)} className="text-gray-600 hover:text-[#c084fc] opacity-0 group-hover:opacity-100" aria-label="Ver historial de avances"><History size={12} /></button>
+                        )}
+                        <button onClick={() => startEditGoal(computed)} className="text-gray-600 hover:text-[#c084fc] opacity-0 group-hover:opacity-100" aria-label="Editar meta"><Pencil size={12} /></button>
+                        <button onClick={() => set({ ...s, goals: s.goals.filter(x => x.id !== computed.id) })} className="text-gray-700 hover:text-red-400 opacity-0 group-hover:opacity-100" aria-label="Eliminar meta"><Trash2 size={12} /></button>
+                      </div>
+                    </div>
+                    {isAbonar && (
+                      <div className="mt-2 flex gap-2 items-center bg-[#0D0D12] rounded-xl p-2.5 border border-emerald-500/20">
+                        <span className="text-xs text-gray-500">Abonar:</span>
+                        <input type="number" value={abonarAmt} onChange={e => setAbonarAmt(e.target.value)} onKeyDown={e => e.key === "Enter" && doAbonar(computed.id)} placeholder={`Monto en ${c}`} autoFocus
+                          className="flex-1 bg-transparent text-white text-sm focus:outline-none placeholder-gray-700" />
+                        <button onClick={() => doAbonar(computed.id)} className="px-3 py-1 bg-emerald-500 text-white rounded-lg text-xs font-medium hover:bg-emerald-600">✓ Agregar</button>
+                        <button onClick={() => setAbonarId(null)} className="text-gray-600 hover:text-gray-300"><X size={13} /></button>
                       </div>
                     )}
-                    <div className="flex items-center gap-2">
-                      <BarFill value={computed.progress} max={100} h={5} color={computed.status === "completed" ? "#10B981" : "#9D4EDD"} />
-                      <span className="text-xs text-gray-500 w-8 text-right">{computed.progress}%</span>
-                    </div>
-                  </div>
-                  <div className="flex items-center gap-1.5 shrink-0">
-                    {isMoney && computed.status !== "completed" && (
-                      <button onClick={() => { setAbonarId(isAbonar ? null : computed.id); setAbonarAmt(""); }}
-                        className="text-xs px-2 py-1 bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 rounded-lg hover:bg-emerald-500/20">
-                        + Abonar
-                      </button>
+                    {expandedGoalId === computed.id && hist.length > 0 && (
+                      <div className="mt-2 bg-[#0D0D12] rounded-xl p-3 border border-white/5 space-y-1.5">
+                        <p className="text-[11px] text-gray-500 uppercase tracking-wider mb-1">Historial de avances ({hist.filter(h => !h.voided).length} activos · {hist.length} total)</p>
+                        {hist.slice().reverse().map(p => (
+                          <div key={p.id} className={`flex items-center gap-2 text-xs ${p.voided ? "opacity-50" : ""}`}>
+                            <span className="text-gray-500">{p.date}</span>
+                            <span className={`font-bold ${p.voided ? "text-gray-500 line-through" : "text-emerald-400"}`}>{p.voided ? "Anulado" : `+${fmtExact(p.amount, c)}`}</span>
+                            {p.note && <span className="text-gray-600 truncate">{p.note}</span>}
+                            {!p.voided && <button onClick={() => setConfirmVoidAvance({ g: computed, p })} className="ml-auto text-[10px] px-2 py-0.5 rounded-lg border border-white/10 text-gray-500 hover:text-amber-400">Anular</button>}
+                            {p.voided && p.voidedAt && <span className="ml-auto text-[10px] text-gray-700">{new Date(p.voidedAt).toLocaleString("es-MX", { dateStyle: "short", timeStyle: "short" })}</span>}
+                          </div>
+                        ))}
+                      </div>
                     )}
-                    {computed.kind !== "money" && computed.status !== "completed" && (
-                      <button onClick={() => { const np = Math.min(100, computed.progress + 20); set({ ...s, goals: s.goals.map(x => x.id === computed.id ? { ...x, progress: np, status: np >= 100 ? "completed" : "in-progress", completedAt: np >= 100 ? today() : undefined } : x) }); }}
-                        className="w-6 h-6 rounded-lg bg-white/5 flex items-center justify-center text-gray-400 hover:text-white text-[10px] opacity-0 group-hover:opacity-100">+</button>
-                    )}
-                    <button onClick={() => set({ ...s, goals: s.goals.filter(x => x.id !== computed.id) })} className="text-gray-700 hover:text-red-400 opacity-0 group-hover:opacity-100"><Trash2 size={12} /></button>
-                  </div>
-                </div>
-                {isAbonar && (
-                  <div className="mt-2 flex gap-2 items-center bg-[#0D0D12] rounded-xl p-2.5 border border-emerald-500/20">
-                    <span className="text-xs text-gray-500">Abonar:</span>
-                    <input type="number" value={abonarAmt} onChange={e => setAbonarAmt(e.target.value)} onKeyDown={e => e.key === "Enter" && doAbonar(computed.id)} placeholder={`Monto en ${c}`} autoFocus
-                      className="flex-1 bg-transparent text-white text-sm focus:outline-none placeholder-gray-700" />
-                    <button onClick={() => doAbonar(computed.id)} className="px-3 py-1 bg-emerald-500 text-white rounded-lg text-xs font-medium hover:bg-emerald-600">✓ Agregar</button>
-                    <button onClick={() => setAbonarId(null)} className="text-gray-600 hover:text-gray-300"><X size={13} /></button>
-                  </div>
+                  </>
                 )}
               </div>
             );
           })}
         </div>
       </Card>
+
+      {/* Confirmar anulación de avance (FASE B): anulación auditada, nunca borrado físico. */}
+      {confirmVoidAvance && (
+        <div className="fixed inset-0 z-[70] bg-black/70 flex items-center justify-center p-4" onClick={() => setConfirmVoidAvance(null)}>
+          <div className="bg-[#16161F] border border-white/10 rounded-2xl p-5 w-full max-w-sm shadow-2xl" onClick={e => e.stopPropagation()}>
+            <p className="text-white font-semibold mb-2">Anular avance</p>
+            <p className="text-sm text-gray-400 mb-4">Se marcará como <span className="text-red-400">anulado</span> (con auditoría) el avance de <span className="text-white font-semibold">{fmtExact(confirmVoidAvance.p.amount, c)}</span> ({confirmVoidAvance.p.date}) de la meta <span className="text-white">{confirmVoidAvance.g.title}</span>. No se elimina físicamente; el avance acumulado volverá a bajar. ¿Continuar?</p>
+            <div className="flex gap-2 justify-end">
+              <button onClick={() => setConfirmVoidAvance(null)} className="px-4 py-2 bg-white/5 text-gray-400 rounded-xl text-sm">Cancelar</button>
+              <button onClick={() => anularAvance(confirmVoidAvance.g.id, confirmVoidAvance.p.id)} className="px-4 py-2 bg-amber-500 text-black rounded-xl text-sm font-medium hover:bg-amber-400">Sí, anular</button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -2155,11 +2663,13 @@ function AssetsTab({ s, set, hideAmounts, onToggleHide }: { s: AppState; set: (x
   const [editId, setEditId] = useState<string | null>(null);
   const [na, setNa] = useState({ name: "", type: "cash" as AssetType, value: "", notes: "" });
   const assets = s.assets || [];
-  const total = assets.reduce((a, x) => a + x.value, 0);
   const byType = ASSET_TYPES.map(t => ({ ...t, items: assets.filter(a => a.type === t.id), subtotal: assets.filter(a => a.type === t.id).reduce((a2, x) => a2 + x.value, 0) })).filter(t => t.subtotal > 0 || t.items.length > 0);
-  const potentialFlow = (s.businesses || []).filter(b => b.status !== "ventas").reduce((a, b) => a + b.value, 0);
-  const cashLiquid = assets.filter(a => a.type === "cash" || a.type === "bank").reduce((a, x) => a + x.value, 0);
-  const cushionMonths = getMonthlyBurn(s) > 0 ? cashLiquid / getMonthlyBurn(s) : 0;
+  // FASE B — fórmulas aprobadas.
+  const totalLiquido = totalLiquidoCalculado(s);      // efectivo cobrado (auto) + ajustes manuales no anulados
+  const potencial = activosPotenciales(s);            // pipeline de negocios con monto potencial
+  const totalAct = totalActivosCalculado(s);          // total líquido calculado + activos potenciales
+  const { byCat, byStage } = desglosePotenciales(s);
+  const potentialItems = (s.businesses || []).filter(b => Number(b.value) > 0);
 
   const startEdit = (a: Asset) => { setEditId(a.id); setNa({ name: a.name, type: a.type, value: String(a.value), notes: a.notes ?? "" }); setShowForm(true); };
   const save = () => {
@@ -2179,29 +2689,81 @@ function AssetsTab({ s, set, hideAmounts, onToggleHide }: { s: AppState; set: (x
 
   return (
     <div className="space-y-5">
+      {/* FASE B — Total de activos = Total líquido calculado + Activos potenciales */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
         <Card className="relative overflow-hidden">
-          <p className="text-xs text-gray-500 uppercase tracking-wider mb-1">Total de Activos</p>
-          <p className="text-3xl font-black text-white">{fmt(total, c)}</p>
-          <p className="text-xs text-gray-600 mt-1">Expresados en dinero</p>
+          <p className="text-xs text-gray-500 uppercase tracking-wider mb-1">Total de activos</p>
+          <p className="text-3xl font-black text-white">{fmtExact(totalAct, c)}</p>
+          <p className="text-[11px] text-gray-600 mt-1">Incluye dinero líquido calculado y oportunidades potenciales; no representa sólo efectivo disponible.</p>
         </Card>
         <Card className="relative overflow-hidden">
-          <p className="text-xs text-gray-500 uppercase tracking-wider mb-1">Líquido (efectivo + bancos)</p>
-          <p className="text-3xl font-black text-emerald-400">{fmt(cashLiquid, c)}</p>
-          <p className="text-xs text-gray-600 mt-1">Colchón: {cushionMonths.toFixed(1)} meses</p>
+          <p className="text-xs text-gray-500 uppercase tracking-wider mb-1">Total líquido calculado</p>
+          <p className="text-3xl font-black text-emerald-400">{fmtExact(totalLiquido, c)}</p>
+          <p className="text-[11px] text-gray-600 mt-1">Efectivo cobrado (auto) + ajustes manuales · cálculo derivado (no incluye por cobrar, deudas ni pipeline).</p>
         </Card>
         <Card className="relative overflow-hidden">
-          <p className="text-xs text-gray-500 uppercase tracking-wider mb-1">Flujo potencial (negocios)</p>
-          <p className="text-3xl font-black text-[#c084fc]">{fmt(potentialFlow, c)}</p>
-          <p className="text-xs text-amber-400/80 mt-1">No es dinero cobrado</p>
+          <p className="text-xs text-gray-500 uppercase tracking-wider mb-1">Activos potenciales</p>
+          <p className="text-3xl font-black text-[#c084fc]">{fmtExact(potencial, c)}</p>
+          <p className="text-[11px] text-amber-400/80 mt-1">Oportunidades del pipeline de negocios con monto potencial · no es dinero cobrado.</p>
         </Card>
       </div>
 
+      {/* Desglose de activos potenciales (FASE B) */}
       <Card>
-        <div className="flex items-center justify-between mb-4">
-          <p className="text-xs text-gray-500 uppercase tracking-wider">Activos registrados</p>
+        <p className="text-xs text-gray-500 uppercase tracking-wider mb-3">Desglose de activos potenciales</p>
+        {potentialItems.length === 0 ? (
+          <p className="text-gray-600 text-sm text-center py-4">Sin oportunidades con monto potencial en el pipeline.</p>
+        ) : (
+          <div className="space-y-4">
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+              <div className="bg-[#0D0D12] rounded-xl p-3 border border-white/5">
+                <p className="text-[11px] text-gray-500 mb-2">Por categoría</p>
+                <div className="space-y-1.5">
+                  {byCat.map(x => (
+                    <div key={x.k} className="flex items-center justify-between text-xs">
+                      <span className="text-gray-300">{x.k}</span>
+                      <span className="font-bold text-[#c084fc]">{fmtExact(x.v, c)}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+              <div className="bg-[#0D0D12] rounded-xl p-3 border border-white/5">
+                <p className="text-[11px] text-gray-500 mb-2">Por etapa</p>
+                <div className="space-y-1.5">
+                  {byStage.map(x => (
+                    <div key={x.k} className="flex items-center justify-between text-xs">
+                      <span className="text-gray-300">{x.k}</span>
+                      <span className="font-bold text-[#c084fc]">{fmtExact(x.v, c)}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+            <div className="space-y-1.5">
+              <p className="text-[11px] text-gray-500 uppercase tracking-wider">Oportunidades ({potentialItems.length})</p>
+              {potentialItems.map(b => {
+                const st = BIZ_STATUS.find(x => x.id === b.status);
+                return (
+                  <div key={b.id} className="flex items-center gap-2 rounded-lg bg-[#16161F]/60 px-2.5 py-1.5 text-xs">
+                    <span className="text-base">{b.emoji}</span>
+                    <span className="text-gray-300 flex-1 truncate">{b.name}</span>
+                    <span className="text-gray-600 hidden sm:inline">{(b.category || "Sin categoría")}</span>
+                    <span className="text-[10px] px-1.5 py-0.5 rounded-full" style={{ background: `${st?.color}20`, color: st?.color }}>{st?.emoji} {st?.label}</span>
+                    <span className="font-bold text-[#c084fc]">{fmtExact(Number(b.value) || 0, c)}</span>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+      </Card>
+
+      <Card>
+        <div className="flex items-center justify-between mb-1">
+          <p className="text-xs text-gray-500 uppercase tracking-wider">Activos registrados manualmente</p>
           <div className="flex items-center gap-1"><EyeToggle hidden={hideAmounts} onToggle={onToggleHide} /><button onClick={() => { setEditId(null); setNa({ name: "", type: "cash", value: "", notes: "" }); setShowForm(!showForm); }} className="flex items-center gap-1.5 text-xs text-[#c084fc] hover:text-[#9D4EDD]"><Plus size={13} /> Agregar activo</button></div>
         </div>
+        <p className="text-[11px] text-gray-600 mb-3">Bloque independiente: no se suma automáticamente al Total de activos ni a Activos potenciales. La clasificación de cada activo (líquido / no líquido / potencial) no es inequívoca en el modelo actual; se muestra por separado hasta definirla explícitamente.</p>
 
         {showForm && (
           <div className="bg-[#0D0D12] rounded-xl p-4 border border-white/8 mb-4 space-y-3">
@@ -2227,7 +2789,7 @@ function AssetsTab({ s, set, hideAmounts, onToggleHide }: { s: AppState; set: (x
             <div key={t.id} className="rounded-xl border border-white/5 bg-[#0D0D12] p-3">
               <div className="flex items-center justify-between mb-2">
                 <div className="flex items-center gap-2"><span>{t.emoji}</span><span className="text-sm font-medium text-white">{t.label}</span></div>
-                <span className="text-sm font-bold" style={{ color: t.color }}>{fmt(t.subtotal, c)}</span>
+                <span className="text-sm font-bold" style={{ color: t.color }}>{fmtExact(t.subtotal, c)}</span>
               </div>
               <div className="space-y-1.5">
                 {t.items.map(a => (
@@ -2235,7 +2797,7 @@ function AssetsTab({ s, set, hideAmounts, onToggleHide }: { s: AppState; set: (x
                     <span className="text-sm text-gray-300 flex-1">{a.name}</span>
                     {a.notes && <span className="text-[10px] text-gray-600 truncate max-w-[160px]">{a.notes}</span>}
                     <span className="text-xs text-gray-400">{a.updatedAt}</span>
-                    <span className="text-sm font-semibold text-white">{fmt(a.value, c)}</span>
+                    <span className="text-sm font-semibold text-white">{fmtExact(a.value, c)}</span>
                     <button onClick={() => startEdit(a)} className="text-gray-600 hover:text-[#c084fc] opacity-0 group-hover:opacity-100"><Pencil size={11} /></button>
                     <button onClick={() => set({ ...s, assets: assets.filter(x => x.id !== a.id) })} className="text-gray-700 hover:text-red-400 opacity-0 group-hover:opacity-100"><Trash2 size={11} /></button>
                   </div>
@@ -2738,6 +3300,27 @@ export default function App() {
     }
   }
 
+  // Mutación verificada de deudas (FASE 2): escribe en user_entities y SOLO si
+  // Supabase responde OK se refleja en la interfaz. Nunca listas parciales.
+  async function mutateDebts(updater: (prev: Debt[]) => Debt[]): Promise<boolean> {
+    const s = sessionRef.current;
+    if (!s?.access_token) { setSaveError("No hay una sesión válida."); return false; }
+    if (!loadedRef.current) { setSaveError("Tus datos aún no se han cargado. Inténtalo en un momento."); return false; }
+    const prev = Array.isArray(dataRef.current.debts) ? dataRef.current.debts : [];
+    const next = updater(prev);
+    if (!validateDebts(next)) { setSaveError("Datos de deuda inválidos. No se guardó nada."); return false; }
+    try {
+      await api.saveEntity(s.access_token, "debts", next);
+      setData({ ...dataRef.current, debts: next });
+      setSaveError(null);
+      return true;
+    } catch (e) {
+      console.error("[SAVE_DEBT_ERROR]", e);
+      setSaveError("No se pudo guardar la deuda. Revisa tu conexión e inténtalo de nuevo.");
+      return false;
+    }
+  }
+
   // Detecta cambios reales (diff contra el último estado conocido en la nube) y agenda el guardado.
   useEffect(() => {
     if (!loadedRef.current) return;               // A1/A3: nada de guardado antes de LOAD
@@ -2950,7 +3533,7 @@ export default function App() {
             </div>
           )}
           {tab === "dashboard" && <DashboardTab s={data} set={setData} hideAmounts={hideAmounts} onToggleHide={toggleHideAmounts} />}
-          {tab === "money" && <MoneyTab s={data} set={setData} hideAmounts={hideAmounts} onToggleHide={toggleHideAmounts} onMutateIncomes={mutateIncomes} />}
+          {tab === "money" && <MoneyTab s={data} set={setData} hideAmounts={hideAmounts} onToggleHide={toggleHideAmounts} onMutateIncomes={mutateIncomes} onMutateDebts={mutateDebts} />}
           {tab === "capital" && <CapitalTab s={data} set={setData} hideAmounts={hideAmounts} onToggleHide={toggleHideAmounts} />}
           {tab === "activos" && <AssetsTab s={data} set={setData} hideAmounts={hideAmounts} onToggleHide={toggleHideAmounts} />}
           {tab === "plan" && <PlanTab s={data} set={setData} />}
