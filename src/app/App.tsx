@@ -88,14 +88,17 @@ interface Task {
 interface Fund { current: number; target: number; }
 interface WeekObjective { id: string; title: string; type: ObjType; completed: boolean; targetAmount?: number; actualAmount?: number; targetDescription?: string; actualDescription?: string; }
 interface PlanWeek { id: string; objectives: WeekObjective[]; learnings: string; }
+// Etapa configurable del pipeline (FASE C): el usuario puede renombrar/reordenar/agregar/eliminar.
+interface StageConfig { id: string; label: string; color: string; emoji: string; }
 interface Business {
   id: string; name: string; category: string; emoji: string;
-  description: string; value: number; status: BusinessStatus;
+  description: string; value: number; status: string; // id de etapa (puede ser custom)
   seller: string; notes: string; contactIds: string[]; createdAt: string;
 }
 interface Contact {
   id: string; name: string; phone: string; email: string; company: string;
-  status: ContactStatus; businessIds: string[]; notes: string; createdAt: string;
+  status: string; // id de etapa (puede ser custom)
+  businessIds: string[]; notes: string; createdAt: string;
 }
 interface RecurringExpense { id: string; category: string; businessCategory: string; description: string; amount: number; active: boolean; }
 interface MiniVictory { id: string; text: string; date: string; category: "task" | "goal" | "habit" | "manual"; emoji: string; }
@@ -127,6 +130,9 @@ interface AppState {
   monthlyFixedExpense: number;
   miniVictories: MiniVictory[];
   quarterHistory: QuarterSnapshot[];
+  // FASE C — configuración de etapas del pipeline (aditiva; fallback a los defaults).
+  bizStageConfig?: StageConfig[];
+  contactStageConfig?: StageConfig[];
 }
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -169,6 +175,22 @@ const CONTACT_STATUS: { id: ContactStatus; label: string; color: string; emoji: 
 const BIZ_EMOJIS = ["💼", "🏠", "🏗️", "🚀", "💡", "🎯", "📱", "🌐", "🏪", "🎬", "📦", "💎", "🔧", "✈️", "🏋️"];
 const OBJ_TYPES: { id: ObjType; label: string; icon: string }[] = [{ id: "monetary", label: "Monetario", icon: "💰" }, { id: "task", label: "Tarea", icon: "✅" }, { id: "habit", label: "Hábito", icon: "🔄" }, { id: "metric", label: "Métrica", icon: "📊" }, { id: "relationship", label: "Relación", icon: "🤝" }, { id: "other", label: "Otro", icon: "⭐" }];
 const PIE_COLORS = ["#9D4EDD", "#3B82F6", "#10B981", "#F59E0B", "#EF4444", "#EC4899", "#06B6D4", "#84CC16"];
+
+// ── FASE C — configuración de etapas del pipeline (fallback a los defaults) ──
+const STAGE_COLORS = ["#6b7280", "#3B82F6", "#F59E0B", "#9D4EDD", "#10B981", "#F97316", "#06B6D4", "#84CC16", "#EF4444", "#EC4899"];
+const DEFAULT_BIZ_STAGES: StageConfig[] = BIZ_STATUS.map(x => ({ id: x.id, label: x.label, color: x.color, emoji: x.emoji }));
+const DEFAULT_CONTACT_STAGES: StageConfig[] = CONTACT_STATUS.map(x => ({ id: x.id, label: x.label, color: x.color, emoji: x.emoji }));
+// Etapas efectivas: si el usuario configuró etapas válidas, se usan; si no, los defaults.
+function bizStages(s: AppState): StageConfig[] {
+  const cfg = s.bizStageConfig;
+  if (Array.isArray(cfg) && cfg.length > 0 && cfg.every(x => x && typeof x.id === "string" && typeof x.label === "string")) return cfg;
+  return DEFAULT_BIZ_STAGES;
+}
+function contactStages(s: AppState): StageConfig[] {
+  const cfg = s.contactStageConfig;
+  if (Array.isArray(cfg) && cfg.length > 0 && cfg.every(x => x && typeof x.id === "string" && typeof x.label === "string")) return cfg;
+  return DEFAULT_CONTACT_STAGES;
+}
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -440,7 +462,7 @@ function desglosePotenciales(s: AppState): { byCat: { k: string; v: number }[]; 
   const stageMap = new Map<string, number>();
   for (const b of items) {
     const cat = (b.category || "").trim() || "Sin categoría";
-    const st = BIZ_STATUS.find(x => x.id === b.status)?.label ?? b.status ?? "Sin etapa";
+    const st = bizStages(s).find(x => x.id === b.status)?.label ?? b.status ?? "Sin etapa";
     catMap.set(cat, (catMap.get(cat) || 0) + (Number(b.value) || 0));
     stageMap.set(st, (stageMap.get(st) || 0) + (Number(b.value) || 0));
   }
@@ -574,6 +596,7 @@ const INIT: AppState = {
   recurringExpenses: [],
   monthlyFixedExpense: 0,
   miniVictories: [], quarterHistory: [],
+  bizStageConfig: undefined, contactStageConfig: undefined,
 };
 
 // ─── Shared UI ────────────────────────────────────────────────────────────────
@@ -1032,9 +1055,14 @@ function CRMTab({ s, set }: { s: AppState; set: (x: AppState) => void }) {
   const [showContactForm, setShowContactForm] = useState(false);
   const [editBizId, setEditBizId] = useState<string | null>(null);
   const [editContactId, setEditContactId] = useState<string | null>(null);
+  // FASE C — editor de etapas del pipeline.
+  const [showStageEditor, setShowStageEditor] = useState<"biz" | "contact" | null>(null);
 
-  const emptyBiz = { name: "", category: "", emoji: "💼", description: "", value: "", status: "idea" as BusinessStatus, seller: "", notes: "", contactIds: [] as string[] };
-  const emptyContact = { name: "", phone: "", email: "", company: "", status: "conversacion" as ContactStatus, businessIds: [] as string[], notes: "" };
+  const bizStagesList = bizStages(s);
+  const contactStagesList = contactStages(s);
+
+  const emptyBiz = { name: "", category: "", emoji: "💼", description: "", value: "", status: bizStagesList[0]?.id ?? "idea", seller: "", notes: "", contactIds: [] as string[] };
+  const emptyContact = { name: "", phone: "", email: "", company: "", status: contactStagesList[0]?.id ?? "conversacion", businessIds: [] as string[], notes: "" };
   const [nb, setNb] = useState(emptyBiz);
   const [nc, setNc] = useState(emptyContact);
 
@@ -1057,14 +1085,14 @@ function CRMTab({ s, set }: { s: AppState; set: (x: AppState) => void }) {
   const startEditBiz = (b: Business) => { setEditBizId(b.id); setNb({ ...b, value: String(b.value) } as any); setShowBizForm(true); };
   const startEditContact = (ct: Contact) => { setEditContactId(ct.id); setNc({ ...ct }); setShowContactForm(true); };
 
-  const moveBiz = (id: string, status: BusinessStatus) => set({ ...s, businesses: s.businesses.map(b => b.id === id ? { ...b, status } : b) });
-  const moveContact = (id: string, status: ContactStatus) => set({ ...s, contacts: s.contacts.map(ct => ct.id === id ? { ...ct, status } : ct) });
+  const moveBiz = (id: string, status: string) => set({ ...s, businesses: s.businesses.map(b => b.id === id ? { ...b, status } : b) });
+  const moveContact = (id: string, status: string) => set({ ...s, contacts: s.contacts.map(ct => ct.id === id ? { ...ct, status } : ct) });
 
-  const dropBiz = (status: BusinessStatus) => { if (draggingId) moveBiz(draggingId, status); setDraggingId(null); setDragOver(null); };
-  const dropContact = (status: ContactStatus) => { if (draggingId) moveContact(draggingId, status); setDraggingId(null); setDragOver(null); };
+  const dropBiz = (status: string) => { if (draggingId) moveBiz(draggingId, status); setDraggingId(null); setDragOver(null); };
+  const dropContact = (status: string) => { if (draggingId) moveContact(draggingId, status); setDraggingId(null); setDragOver(null); };
 
   const totalBizPipeline = s.businesses.filter(b => b.status === "ventas").reduce((a, b) => a + b.value, 0);
-  const activeBiz = s.businesses.filter(b => b.status !== "idea").length;
+  const activeBiz = s.businesses.filter(b => b.status !== (bizStagesList[0]?.id)).length;
 
   const inpCls = "w-full bg-[#0D0D12] border border-white/10 text-white rounded-xl px-3 py-2.5 text-sm placeholder-gray-700 focus:outline-none focus:border-[#9D4EDD]/60";
 
@@ -1082,6 +1110,7 @@ function CRMTab({ s, set }: { s: AppState; set: (x: AppState) => void }) {
         <div className="flex items-center gap-3 text-sm text-gray-400">
           <span>En Ventas: <span className="text-emerald-400 font-bold">{fmtExact(totalBizPipeline, c)}</span></span>
           <span>Activos: <span className="text-[#c084fc] font-bold">{activeBiz}</span></span>
+          <button onClick={() => setShowStageEditor(view === "negocios" ? "biz" : "contact")} className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-medium bg-white/5 border border-white/10 text-gray-300 hover:text-white hover:bg-white/10"><Settings size={13} /> Etapas</button>
         </div>
         {view === "negocios" ? (
           <button onClick={() => { setEditBizId(null); setNb(emptyBiz); setShowBizForm(!showBizForm); }} className="flex items-center gap-2 px-4 py-2 bg-[#9D4EDD] text-white rounded-xl text-sm font-medium hover:bg-[#7B2CBF]">
@@ -1111,7 +1140,7 @@ function CRMTab({ s, set }: { s: AppState; set: (x: AppState) => void }) {
             </div>
             <Inp label="Nombre del negocio / producto" value={nb.name} onChange={v => setNb({ ...nb, name: v })} placeholder="Ej: Consultoría SEO, Casa Roma, Curso..." full />
             <Inp label="Categoría (libre)" value={nb.category} onChange={v => setNb({ ...nb, category: v })} placeholder="Bienes raíces, Digital, Servicio..." />
-            <div><label className="text-xs text-gray-500 mb-1.5 block">Etapa inicial</label><select value={nb.status} onChange={e => setNb({ ...nb, status: e.target.value as BusinessStatus })} className={inpCls}>{BIZ_STATUS.map(bs => <option key={bs.id} value={bs.id}>{bs.emoji} {bs.label}</option>)}</select></div>
+            <div><label className="text-xs text-gray-500 mb-1.5 block">Etapa inicial</label><select value={nb.status} onChange={e => setNb({ ...nb, status: e.target.value })} className={inpCls}>{bizStagesList.map(bs => <option key={bs.id} value={bs.id}>{bs.emoji} {bs.label}</option>)}</select></div>
             <Inp label="Descripción" value={nb.description} onChange={v => setNb({ ...nb, description: v })} placeholder="Detalle del negocio..." full />
             <Inp label="Valor estimado ($)" type="number" value={nb.value} onChange={v => setNb({ ...nb, value: v })} placeholder="0" />
             <Inp label="Vendedor / Responsable" value={nb.seller} onChange={v => setNb({ ...nb, seller: v })} placeholder="Nombre de quien vende..." />
@@ -1143,7 +1172,7 @@ function CRMTab({ s, set }: { s: AppState; set: (x: AppState) => void }) {
           <div className="grid grid-cols-2 gap-3">
             <Inp label="Nombre completo" value={nc.name} onChange={v => setNc({ ...nc, name: v })} placeholder="Juan Pérez..." full />
             <Inp label="Empresa / Organización" value={nc.company} onChange={v => setNc({ ...nc, company: v })} placeholder="Empresa SA..." />
-            <div><label className="text-xs text-gray-500 mb-1.5 block">Etapa</label><select value={nc.status} onChange={e => setNc({ ...nc, status: e.target.value as ContactStatus })} className={inpCls}>{CONTACT_STATUS.map(cs => <option key={cs.id} value={cs.id}>{cs.emoji} {cs.label}</option>)}</select></div>
+            <div><label className="text-xs text-gray-500 mb-1.5 block">Etapa</label><select value={nc.status} onChange={e => setNc({ ...nc, status: e.target.value })} className={inpCls}>{contactStagesList.map(cs => <option key={cs.id} value={cs.id}>{cs.emoji} {cs.label}</option>)}</select></div>
             <Inp label="Teléfono" value={nc.phone} onChange={v => setNc({ ...nc, phone: v })} placeholder="+52 55 1234 5678" />
             <Inp label="Email" type="email" value={nc.email} onChange={v => setNc({ ...nc, email: v })} placeholder="correo@empresa.com" />
             <Inp label="Notas" value={nc.notes} onChange={v => setNc({ ...nc, notes: v })} placeholder="Intereses, observaciones..." full />
@@ -1170,9 +1199,10 @@ function CRMTab({ s, set }: { s: AppState; set: (x: AppState) => void }) {
       {/* ── KANBAN NEGOCIOS ────────────────────────────────────────────────── */}
       {view === "negocios" && (
         <div className="flex gap-3 overflow-x-auto pb-4 -mx-1 px-1" style={{ minHeight: 300 }}>
-          {BIZ_STATUS.map(bs => {
+          {bizStagesList.map(bs => {
             const cols = s.businesses.filter(b => b.status === bs.id);
             const isDrag = dragOver === bs.id;
+            const bi = bizStagesList.findIndex(x => x.id === bs.id);
             return (
               <div key={bs.id}
                 onDragOver={e => { e.preventDefault(); setDragOver(bs.id); }}
@@ -1216,8 +1246,8 @@ function CRMTab({ s, set }: { s: AppState; set: (x: AppState) => void }) {
                         )}
                         {biz.notes && <p className="text-[10px] text-gray-600 mt-1.5 line-clamp-1">{biz.notes}</p>}
                         <div className="flex gap-1 mt-2.5">
-                          {BIZ_STATUS.findIndex(x => x.id === bs.id) > 0 && <button onClick={() => moveBiz(biz.id, BIZ_STATUS[BIZ_STATUS.findIndex(x => x.id === bs.id) - 1].id)} className="flex-1 py-1 text-[10px] bg-white/5 border border-white/8 rounded-lg text-gray-500 hover:text-gray-300">← Atrás</button>}
-                          {BIZ_STATUS.findIndex(x => x.id === bs.id) < BIZ_STATUS.length - 1 && <button onClick={() => moveBiz(biz.id, BIZ_STATUS[BIZ_STATUS.findIndex(x => x.id === bs.id) + 1].id)} className="flex-1 py-1 text-[10px] rounded-lg font-medium text-white" style={{ background: `${bs.color}30`, border: `1px solid ${bs.color}50`, color: bs.color }}>Avanzar →</button>}
+                          {bi > 0 && <button onClick={() => moveBiz(biz.id, bizStagesList[bi - 1].id)} className="flex-1 py-1 text-[10px] bg-white/5 border border-white/8 rounded-lg text-gray-500 hover:text-gray-300">← Atrás</button>}
+                          {bi < bizStagesList.length - 1 && <button onClick={() => moveBiz(biz.id, bizStagesList[bi + 1].id)} className="flex-1 py-1 text-[10px] rounded-lg font-medium text-white" style={{ background: `${bs.color}30`, border: `1px solid ${bs.color}50`, color: bs.color }}>Avanzar →</button>}
                         </div>
                       </div>
                     );
@@ -1233,9 +1263,10 @@ function CRMTab({ s, set }: { s: AppState; set: (x: AppState) => void }) {
       {/* ── KANBAN CONTACTOS ───────────────────────────────────────────────── */}
       {view === "contactos" && (
         <div className="flex gap-3 overflow-x-auto pb-4 -mx-1 px-1" style={{ minHeight: 300 }}>
-          {CONTACT_STATUS.map(cs => {
+          {contactStagesList.map(cs => {
             const cols = s.contacts.filter(ct => ct.status === cs.id);
             const isDrag = dragOver === cs.id;
+            const ci = contactStagesList.findIndex(x => x.id === cs.id);
             return (
               <div key={cs.id}
                 onDragOver={e => { e.preventDefault(); setDragOver(cs.id); }}
@@ -1271,13 +1302,13 @@ function CRMTab({ s, set }: { s: AppState; set: (x: AppState) => void }) {
                         {ct.email && <p className="text-[10px] text-gray-500">✉️ {ct.email}</p>}
                         {linkedBiz.length > 0 && (
                           <div className="mt-2 flex flex-wrap gap-1">{linkedBiz.slice(0, 3).map(b => (
-                            <span key={b.id} className="text-[9px] px-1.5 py-0.5 rounded-full font-medium" style={{ background: `${BIZ_STATUS.find(x => x.id === b.status)?.color}20`, color: BIZ_STATUS.find(x => x.id === b.status)?.color }}>{b.emoji} {b.name.slice(0, 12)}</span>
+                            <span key={b.id} className="text-[9px] px-1.5 py-0.5 rounded-full font-medium" style={{ background: `${bizStagesList.find(x => x.id === b.status)?.color}20`, color: bizStagesList.find(x => x.id === b.status)?.color }}>{b.emoji} {b.name.slice(0, 12)}</span>
                           ))}</div>
                         )}
                         {ct.notes && <p className="text-[10px] text-gray-600 mt-1.5 line-clamp-1">{ct.notes}</p>}
                         <div className="flex gap-1 mt-2.5">
-                          {CONTACT_STATUS.findIndex(x => x.id === cs.id) > 0 && <button onClick={() => moveContact(ct.id, CONTACT_STATUS[CONTACT_STATUS.findIndex(x => x.id === cs.id) - 1].id)} className="flex-1 py-1 text-[10px] bg-white/5 border border-white/8 rounded-lg text-gray-500 hover:text-gray-300">← Atrás</button>}
-                          {CONTACT_STATUS.findIndex(x => x.id === cs.id) < CONTACT_STATUS.length - 1 && <button onClick={() => moveContact(ct.id, CONTACT_STATUS[CONTACT_STATUS.findIndex(x => x.id === cs.id) + 1].id)} className="flex-1 py-1 text-[10px] rounded-lg font-medium text-white" style={{ background: `${cs.color}30`, border: `1px solid ${cs.color}50`, color: cs.color }}>Avanzar →</button>}
+                          {ci > 0 && <button onClick={() => moveContact(ct.id, contactStagesList[ci - 1].id)} className="flex-1 py-1 text-[10px] bg-white/5 border border-white/8 rounded-lg text-gray-500 hover:text-gray-300">← Atrás</button>}
+                          {ci < contactStagesList.length - 1 && <button onClick={() => moveContact(ct.id, contactStagesList[ci + 1].id)} className="flex-1 py-1 text-[10px] rounded-lg font-medium text-white" style={{ background: `${cs.color}30`, border: `1px solid ${cs.color}50`, color: cs.color }}>Avanzar →</button>}
                           {cs.id === "cierre" && linkedBiz.length > 0 && (
                             <button onClick={() => {
                               // Mover negocios vinculados a "ventas"
@@ -1296,6 +1327,91 @@ function CRMTab({ s, set }: { s: AppState; set: (x: AppState) => void }) {
           })}
         </div>
       )}
+
+      {/* FASE C — editor de etapas del pipeline */}
+      {showStageEditor && <StageConfigEditor s={s} set={set} kind={showStageEditor} onClose={() => setShowStageEditor(null)} />}
+    </div>
+  );
+}
+
+// ─── Editor de etapas del pipeline (FASE C) ──────────────────────────────────
+function StageConfigEditor({ s, set, kind, onClose }: { s: AppState; set: (x: AppState) => void; kind: "biz" | "contact"; onClose: () => void }) {
+  const effective = kind === "biz" ? bizStages(s) : contactStages(s);
+  const [draft, setDraft] = useState<StageConfig[]>(() => effective.map(x => ({ ...x })));
+  const [msg, setMsg] = useState<string | null>(null);
+  const items = kind === "biz" ? s.businesses : s.contacts;
+
+  const commit = (next: StageConfig[]) => {
+    if (kind === "biz") set({ ...s, bizStageConfig: next });
+    else set({ ...s, contactStageConfig: next });
+    onClose();
+  };
+  const setAt = (i: number, patch: Partial<StageConfig>) => setDraft(d => d.map((x, j) => j === i ? { ...x, ...patch } : x));
+  const move = (i: number, dir: -1 | 1) => setDraft(d => {
+    const j = i + dir;
+    if (j < 0 || j >= d.length) return d;
+    const next = [...d];
+    [next[i], next[j]] = [next[j], next[i]];
+    return next;
+  });
+  const add = () => {
+    const base = kind === "biz" ? "etapa" : "fase";
+    setDraft(d => [...d, { id: `${base}-${uid()}`, label: `Nueva etapa ${d.length + 1}`, color: STAGE_COLORS[d.length % STAGE_COLORS.length], emoji: kind === "biz" ? "💼" : "👤" }]);
+  };
+  const remove = (i: number) => {
+    const st = draft[i];
+    if (!st) return;
+    const count = items.filter(x => x.status === st.id).length;
+    if (count > 0) { setMsg(`No se puede eliminar "${st.label}": tiene ${count} elemento(s). Muévelos a otra etapa primero.`); return; }
+    setMsg(null);
+    setDraft(d => d.filter((_, j) => j !== i));
+  };
+  const save = () => {
+    if (!draft.length) { setMsg("Debe existir al menos una etapa."); return; }
+    if (draft.some(x => !x.label.trim())) { setMsg("Todas las etapas deben tener un nombre."); return; }
+    commit(draft);
+  };
+  const reset = () => {
+    if (kind === "biz") set({ ...s, bizStageConfig: undefined });
+    else set({ ...s, contactStageConfig: undefined });
+    onClose();
+  };
+
+  return (
+    <div className="fixed inset-0 z-[70] bg-black/70 flex items-center justify-center p-4" onClick={onClose}>
+      <div className="bg-[#16161F] border border-white/10 rounded-2xl p-5 w-full max-w-lg shadow-2xl max-h-[85vh] overflow-y-auto" onClick={e => e.stopPropagation()}>
+        <div className="flex items-center justify-between mb-1">
+          <p className="text-white font-semibold">Etapas · {kind === "biz" ? "Negocios" : "Contactos"}</p>
+          <button onClick={onClose} className="text-gray-500 hover:text-white" aria-label="Cerrar editor de etapas"><X size={16} /></button>
+        </div>
+        <p className="text-[11px] text-gray-500 mb-3">Renombra, reordena, agrega o elimina etapas. No afecta el dinero (efectivo) ni los ingresos. Una etapa con elementos no se puede eliminar.</p>
+        <div className="space-y-2 mb-3">
+          {draft.map((st, i) => (
+            <div key={st.id} className="flex items-center gap-2 bg-[#0D0D12] rounded-xl p-2 border border-white/5">
+              <div className="flex flex-col shrink-0">
+                <button onClick={() => move(i, -1)} disabled={i === 0} className="text-gray-500 hover:text-white disabled:opacity-30" aria-label="Subir etapa"><ChevronUp size={12} /></button>
+                <button onClick={() => move(i, 1)} disabled={i === draft.length - 1} className="text-gray-500 hover:text-white disabled:opacity-30" aria-label="Bajar etapa"><ChevronDown size={12} /></button>
+              </div>
+              <input value={st.emoji} onChange={e => setAt(i, { emoji: e.target.value })} className="w-10 text-center bg-[#16161F] border border-white/10 text-white rounded-lg px-1 py-1.5 text-sm focus:outline-none" aria-label={`Emoji etapa ${st.label}`} />
+              <input value={st.label} onChange={e => setAt(i, { label: e.target.value })} className="flex-1 min-w-0 bg-[#16161F] border border-white/10 text-white rounded-lg px-2 py-1.5 text-sm focus:outline-none" aria-label={`Nombre etapa ${i + 1}`} />
+              <div className="flex flex-wrap gap-1 max-w-[120px] shrink-0">
+                {STAGE_COLORS.slice(0, 8).map(col => (
+                  <button key={col} onClick={() => setAt(i, { color: col })} className={`w-4 h-4 rounded-full border ${st.color === col ? "border-white ring-2 ring-white/30" : "border-white/10"}`} style={{ background: col }} aria-label={`Color ${col}`} />
+                ))}
+              </div>
+              <button onClick={() => remove(i)} className="text-gray-600 hover:text-red-400 shrink-0" aria-label={`Eliminar etapa ${st.label}`}><Trash2 size={12} /></button>
+            </div>
+          ))}
+        </div>
+        {msg && <p className="text-xs text-amber-400 bg-amber-500/10 border border-amber-500/20 rounded-xl px-3 py-2 mb-3">{msg}</p>}
+        <div className="flex gap-2 flex-wrap">
+          <button onClick={add} className="flex items-center gap-1.5 px-3 py-2 bg-white/5 border border-white/10 text-gray-300 rounded-xl text-xs hover:bg-white/10"><Plus size={13} /> Agregar etapa</button>
+          <button onClick={reset} className="px-3 py-2 bg-white/5 border border-white/10 text-gray-400 rounded-xl text-xs hover:bg-white/10">Restaurar por defecto</button>
+          <div className="flex-1" />
+          <button onClick={onClose} className="px-3 py-2 bg-white/5 text-gray-400 rounded-xl text-xs">Cancelar</button>
+          <button onClick={save} className="px-4 py-2 bg-[#9D4EDD] text-white rounded-xl text-xs font-medium hover:bg-[#7B2CBF]">Guardar cambios</button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -2742,7 +2858,7 @@ function AssetsTab({ s, set, hideAmounts, onToggleHide }: { s: AppState; set: (x
             <div className="space-y-1.5">
               <p className="text-[11px] text-gray-500 uppercase tracking-wider">Oportunidades ({potentialItems.length})</p>
               {potentialItems.map(b => {
-                const st = BIZ_STATUS.find(x => x.id === b.status);
+                const st = bizStages(s).find(x => x.id === b.status);
                 return (
                   <div key={b.id} className="flex items-center gap-2 rounded-lg bg-[#16161F]/60 px-2.5 py-1.5 text-xs">
                     <span className="text-base">{b.emoji}</span>
