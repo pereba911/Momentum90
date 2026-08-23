@@ -12,12 +12,30 @@ const app = new Hono();
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SUPABASE_ANON_KEY = Deno.env.get("SUPABASE_ANON_KEY")!;
 const DEEPSEEK_API_KEY = Deno.env.get("DEEPSEEK_API_KEY") ?? "";
+const MAX_TEXT_LENGTH = 2000;
+const DEEPSEEK_TIMEOUT_MS = 30_000;
 
 const authClient = () => createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
+// CORS restringido: solo el dominio de producción y hosts locales de desarrollo.
+const PROD_ORIGINS = [
+  "https://itsmomentum90.netlify.app",
+  "https://main--itsmomentum90.netlify.app",
+];
+function isAllowedOrigin(origin: string | undefined): boolean {
+  if (!origin) return false;
+  if (PROD_ORIGINS.includes(origin)) return true;
+  try {
+    const u = new URL(origin);
+    return u.hostname === "localhost" || u.hostname === "127.0.0.1";
+  } catch {
+    return false;
+  }
+}
+
 app.use("*", logger(console.log));
 app.use("/*", cors({
-  origin: "*",
+  origin: (origin) => (isAllowedOrigin(origin) ? origin : null),
   allowHeaders: ["Content-Type", "Authorization"],
   allowMethods: ["POST", "OPTIONS"],
   maxAge: 600,
@@ -47,25 +65,41 @@ app.post("*", async (c) => {
     const text = String(body?.text ?? "").trim();
     const userContext = body?.userContext as UserContext | undefined;
     if (!text) return c.json({ success: false, error: "Falta el texto a procesar." }, 400);
+    if (text.length > MAX_TEXT_LENGTH) {
+      return c.json({ success: false, error: `El texto excede el límite de ${MAX_TEXT_LENGTH} caracteres.` }, 400);
+    }
     if (!userContext || !Array.isArray(userContext.categories)) {
       return c.json({ success: false, error: "Falta userContext válido." }, 400);
     }
 
     const prompt = `${buildMasterPrompt(userContext)}\n\nTEXTO TRANSCRITO DEL USUARIO:\n"${text}"`;
 
-    const res = await fetch("https://api.deepseek.com/v1/chat/completions", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${DEEPSEEK_API_KEY}` },
-      body: JSON.stringify({
-        model: "deepseek-chat",
-        messages: [
-          { role: "system", content: "Eres un asistente que responde SOLO con JSON válido, sin markdown." },
-          { role: "user", content: prompt },
-        ],
-        temperature: 0.1,
-        response_format: { type: "json_object" },
-      }),
-    });
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), DEEPSEEK_TIMEOUT_MS);
+    let res: Response;
+    try {
+      res = await fetch("https://api.deepseek.com/v1/chat/completions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${DEEPSEEK_API_KEY}` },
+        body: JSON.stringify({
+          model: "deepseek-chat",
+          messages: [
+            { role: "system", content: "Eres un asistente que responde SOLO con JSON válido, sin markdown." },
+            { role: "user", content: prompt },
+          ],
+          temperature: 0.1,
+          response_format: { type: "json_object" },
+        }),
+        signal: controller.signal,
+      });
+    } catch (e) {
+      clearTimeout(timeout);
+      if (e instanceof Error && e.name === "AbortError") {
+        return c.json({ success: false, error: "La IA tardó demasiado; intenta de nuevo." }, 504);
+      }
+      throw e;
+    }
+    clearTimeout(timeout);
 
     if (!res.ok) {
       let detail = `HTTP ${res.status}`;
