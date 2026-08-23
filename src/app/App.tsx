@@ -8,7 +8,7 @@ import {
   Wallet, ShieldCheck, Users, Plug, AlertCircle, Info,
   FileDown, ChevronUp, History, Mic
 } from "lucide-react";
-import { api, supabase, SUPABASE_CONFIGURED, DEFAULT_SETTINGS, type AppEntityName, type Asset, type AssetType, type IntegrationConfig } from "../lib/supabase";
+import { api, supabase, SUPABASE_CONFIGURED, DEFAULT_SETTINGS, canAccess, getDaysLeft, type AppEntityName, type Asset, type AssetType, type IntegrationConfig } from "../lib/supabase";
 import { buildExpenseReportPdf } from "./reportPdf";
 import QuickRecordPage from "../pages/QuickRecordPage";
 import {
@@ -2959,23 +2959,12 @@ function TasksTab({ s, set }: { s: AppState; set: (x: AppState) => void }) {
 
 // ─── Settings Panel ───────────────────────────────────────────────────────────
 
-function SettingsPanel({ userEmail, onLogout, profile, accessToken }: { userEmail: string; onLogout: () => void; profile: UserProfile | null; accessToken?: string; }) {
+function SettingsPanel({ userEmail, onLogout, profile, accessToken, onOpenAdmin }: { userEmail: string; onLogout: () => void; profile: UserProfile | null; accessToken?: string; onOpenAdmin: () => void; }) {
   const [newPass, setNewPass] = useState("");
   const [confirmPass, setConfirmPass] = useState("");
   const [showPass, setShowPass] = useState(false);
   const [msg, setMsg] = useState("");
   const [saving, setSaving] = useState(false);
-  const [trialDays, setTrialDays] = useState(14);
-  const [newUserEmail, setNewUserEmail] = useState("");
-  const [newUserPass, setNewUserPass] = useState("");
-  const [adminUsers, setAdminUsers] = useState<UserProfile[]>([]);
-  const [adminAction, setAdminAction] = useState("");
-  const [adminLoading, setAdminLoading] = useState(false);
-
-  useEffect(() => {
-    if (!profile || profile.role !== "admin" || !accessToken) return;
-    api.getUsers(accessToken).then((res) => setAdminUsers(res?.users ?? [])).catch(() => {});
-  }, [profile, accessToken]);
 
   const changePassword = async () => {
     if (!newPass) return;
@@ -3054,24 +3043,11 @@ function SettingsPanel({ userEmail, onLogout, profile, accessToken }: { userEmai
 
         {profile?.role === "admin" && (
           <Card>
-            <p className="text-xs text-gray-500 uppercase tracking-wider mb-4">🛡️ Admin · Crear usuario con trial</p>
-            <div className="space-y-3">
-              <input value={newUserEmail} onChange={e => setNewUserEmail(e.target.value)} placeholder="Email del usuario" className="w-full bg-[#0D0D12] border border-white/10 text-white rounded-xl px-3 py-2.5 text-sm" />
-              <input value={newUserPass} onChange={e => setNewUserPass(e.target.value)} placeholder="Contraseña temporal" className="w-full bg-[#0D0D12] border border-white/10 text-white rounded-xl px-3 py-2.5 text-sm" />
-              <input type="number" min="1" value={trialDays} onChange={e => setTrialDays(Number(e.target.value))} placeholder="Trial en días" className="w-full bg-[#0D0D12] border border-white/10 text-white rounded-xl px-3 py-2.5 text-sm" />
-              <button onClick={createAdminUser} disabled={adminLoading || !accessToken} className="w-full py-2.5 rounded-xl text-sm font-medium bg-[#9D4EDD] text-white hover:bg-[#7B2CBF] disabled:opacity-50">
-                {adminLoading ? "Creando…" : "Crear usuario + asignar trial"}
-              </button>
-              {adminAction && <p className="text-xs px-3 py-2 rounded-xl bg-white/5 border border-white/10 text-gray-300">{adminAction}</p>}
-              <div className="max-h-40 overflow-auto space-y-2">
-                {adminUsers.map((u) => (
-                  <div key={u.id} className="rounded-xl bg-[#0D0D12] border border-white/5 p-2.5 text-xs text-gray-300">
-                    <div className="font-medium text-white">{u.email}</div>
-                    <div className="mt-1 text-gray-500">{u.subscription_status} · {u.trial_days ?? 14} días</div>
-                  </div>
-                ))}
-              </div>
-            </div>
+            <p className="text-xs text-gray-500 uppercase tracking-wider mb-3">🛡️ Admin</p>
+            <button onClick={onOpenAdmin} className="w-full py-3 rounded-xl text-sm font-medium bg-[#9D4EDD]/15 border border-[#9D4EDD]/30 text-[#c084fc] hover:bg-[#9D4EDD]/25">
+              Usuarios y trials
+            </button>
+            <p className="text-[11px] text-gray-600 mt-2">Gestiona usuarios, trials, accesos, invitaciones, auditoría y eliminación con confirmación.</p>
           </Card>
         )}
       </div>
@@ -3262,19 +3238,166 @@ function AssetsTab({ s, set, hideAmounts, onToggleHide }: { s: AppState; set: (x
   );
 }
 
-// ─── Admin Dashboard (solo admin) ─────────────────────────────────────────────
+// ─── Admin: modal de trial (fecha exacta o duración rápida) ──────────────────
+function AdminTrialModal({ user, accessToken, onClose, onDone, notify }: {
+  user: UserProfile; accessToken?: string; onClose: () => void; onDone: () => Promise<void>; notify: (m: string, isErr?: boolean) => void;
+}) {
+  const [trialEnd, setTrialEnd] = useState(user?.trial_end ? user.trial_end.slice(0, 10) : "");
+  const [busy, setBusy] = useState(false);
+  const quick = async (d: number) => {
+    if (!accessToken) return;
+    setBusy(true);
+    try { await api.adminSetTrial(accessToken, { userId: user.id, trialDays: d }); notify(`Trial asignado: ${d} días.`); await onDone(); onClose(); }
+    catch (e: any) { notify(e.message, true); } finally { setBusy(false); }
+  };
+  const saveExact = async () => {
+    if (!trialEnd || !accessToken) { notify("Selecciona una fecha.", true); return; }
+    setBusy(true);
+    try { await api.adminSetTrial(accessToken, { userId: user.id, trialEnd }); notify("Trial actualizado con fecha exacta."); await onDone(); onClose(); }
+    catch (e: any) { notify(e.message, true); } finally { setBusy(false); }
+  };
+  return (
+    <div className="fixed inset-0 z-[90] bg-black/70 flex items-center justify-center p-4" onClick={onClose}>
+      <div className="w-full max-w-md bg-[#16161F] border border-white/10 rounded-2xl p-5 space-y-4" onClick={(e) => e.stopPropagation()}>
+        <p className="text-white font-semibold">Trial · {user.email}</p>
+        <div className="flex flex-wrap gap-2">
+          {[7, 14, 30, 60, 90].map(d => (
+            <button key={d} onClick={() => quick(d)} disabled={busy} className="px-3 py-1.5 rounded-xl text-xs font-medium bg-white/5 border border-white/10 text-gray-300 hover:bg-[#9D4EDD]/20 disabled:opacity-50">{d} días</button>
+          ))}
+        </div>
+        <div className="flex gap-2 items-end">
+          <label className="flex-1 text-xs text-gray-500">Fecha exacta de fin (AAAA-MM-DD)
+            <input type="date" value={trialEnd} onChange={(e) => setTrialEnd(e.target.value)} className="mt-1 w-full bg-[#0D0D12] border border-white/10 text-white rounded-xl px-3 py-2.5 text-sm" />
+          </label>
+          <button onClick={saveExact} disabled={busy || !accessToken} className="px-4 py-2.5 rounded-xl text-sm font-medium bg-[#9D4EDD] text-white hover:bg-[#7B2CBF] disabled:opacity-50">Guardar</button>
+        </div>
+        <button onClick={onClose} className="text-xs text-gray-500 hover:text-white">Cancelar</button>
+      </div>
+    </div>
+  );
+}
 
+// ─── Admin: modal de suspensión con motivo ───────────────────────────────────
+function AdminSuspendModal({ user, accessToken, onClose, onDone, notify }: {
+  user: UserProfile; accessToken?: string; onClose: () => void; onDone: () => Promise<void>; notify: (m: string, isErr?: boolean) => void;
+}) {
+  const [reason, setReason] = useState("");
+  const [busy, setBusy] = useState(false);
+  const doSuspend = async () => {
+    if (!reason.trim() || !accessToken) { notify("El motivo es requerido.", true); return; }
+    setBusy(true);
+    try { await api.adminSuspendAccess(accessToken, { userId: user.id, reason: reason.trim() }); notify("Acceso suspendido (los datos se conservan)."); await onDone(); onClose(); }
+    catch (e: any) { notify(e.message, true); } finally { setBusy(false); }
+  };
+  return (
+    <div className="fixed inset-0 z-[90] bg-black/70 flex items-center justify-center p-4" onClick={onClose}>
+      <div className="w-full max-w-md bg-[#16161F] border border-amber-500/30 rounded-2xl p-5 space-y-3" onClick={(e) => e.stopPropagation()}>
+        <p className="text-amber-400 font-semibold">Suspender acceso · {user.email}</p>
+        <p className="text-xs text-gray-500">El usuario no podrá entrar, pero sus datos se conservan intactos.</p>
+        <textarea value={reason} onChange={(e) => setReason(e.target.value)} placeholder="Motivo de la suspensión (obligatorio)" rows={3} className="w-full bg-[#0D0D12] border border-white/10 text-white rounded-xl px-3 py-2.5 text-sm resize-none" />
+        <div className="flex gap-2">
+          <button onClick={doSuspend} disabled={busy || !accessToken} className="flex-1 py-2.5 rounded-xl text-sm font-medium bg-amber-500 text-black hover:bg-amber-400 disabled:opacity-50">{busy ? "Suspendiendo…" : "Suspender"}</button>
+          <button onClick={onClose} className="px-4 py-2.5 rounded-xl text-sm text-gray-500 hover:text-white">Cancelar</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Admin: modal de auditoría de un usuario ─────────────────────────────────
+function AdminAuditModal({ userId, email, accessToken, onClose }: { userId: string; email: string; accessToken?: string; onClose: () => void }) {
+  const [rows, setRows] = useState<any[]>([]);
+  useEffect(() => {
+    if (!accessToken) return;
+    api.adminListAudit(accessToken, userId).then(r => setRows(r?.audit ?? [])).catch(() => setRows([]));
+  }, [accessToken, userId]);
+  return (
+    <div className="fixed inset-0 z-[90] bg-black/70 flex items-center justify-center p-4" onClick={onClose}>
+      <div className="w-full max-w-lg bg-[#16161F] border border-white/10 rounded-2xl p-5 max-h-[80vh] overflow-auto" onClick={(e) => e.stopPropagation()}>
+        <p className="text-white font-semibold mb-2">Auditoría · {email}</p>
+        {rows.length === 0 && <p className="text-gray-600 text-sm">Sin acciones administrativas registradas.</p>}
+        <div className="space-y-2">
+          {rows.map(r => (
+            <div key={r.id} className="rounded-xl bg-[#0D0D12] border border-white/5 p-2.5 text-xs text-gray-300">
+              <div className="flex items-center justify-between"><span className="font-medium text-[#c084fc]">{r.action}</span><span className="text-gray-600">{new Date(r.created_at).toLocaleString("es-MX")}</span></div>
+              {r.reason && <div className="mt-1 text-gray-500">Motivo: {r.reason}</div>}
+              {r.before_state && <div className="mt-1 text-[10px] text-gray-600 break-all">antes: {JSON.stringify(r.before_state)}</div>}
+              {r.after_state && <div className="text-[10px] text-gray-600 break-all">después: {JSON.stringify(r.after_state)}</div>}
+            </div>
+          ))}
+        </div>
+        <button onClick={onClose} className="mt-3 text-xs text-gray-500 hover:text-white">Cerrar</button>
+      </div>
+    </div>
+  );
+}
+
+// ─── Admin: modal de eliminación de alto riesgo ──────────────────────────────
+function AdminDeleteModal({ user, counts, accessToken, onClose, onDone, notify }: {
+  user: UserProfile; counts: Record<string, number>; accessToken?: string; onClose: () => void; onDone: () => Promise<void>; notify: (m: string, isErr?: boolean) => void;
+}) {
+  const [phrase, setPhrase] = useState("");
+  const [confirmEmail, setConfirmEmail] = useState("");
+  const [busy, setBusy] = useState(false);
+  const confirmed = phrase.trim() === "Eliminar permanentemente datos y cuenta" && confirmEmail.trim().toLowerCase() === (user.email ?? "").toLowerCase();
+  const total = Object.values(counts ?? {}).reduce((a, b) => a + (typeof b === "number" && b > 0 ? b : 0), 0);
+  const doDelete = async () => {
+    if (!confirmed || !accessToken) return;
+    setBusy(true);
+    try {
+      await api.adminDeleteUser(accessToken, { userId: user.id, confirmEmail: confirmEmail.trim() });
+      notify("Usuario eliminado permanentemente.");
+      await onDone(); onClose();
+    } catch (e: any) { notify(e.message, true); } finally { setBusy(false); }
+  };
+  return (
+    <div className="fixed inset-0 z-[95] bg-black/70 flex items-center justify-center p-4" onClick={onClose}>
+      <div className="w-full max-w-md bg-[#16161F] border border-red-500/30 rounded-2xl p-5 space-y-3" onClick={(e) => e.stopPropagation()}>
+        <p className="text-red-400 font-bold">Eliminar permanentemente datos y cuenta</p>
+        <ul className="text-xs text-gray-400 list-disc pl-5 space-y-0.5">
+          <li>Email: <span className="text-white">{user.email}</span></li>
+          <li>user_id: <span className="text-white">{user.id}</span></li>
+          <li>Registros asociados: <span className="text-white">{total}</span> (configuración, app_data, entidades, roles, perfil, sesiones)</li>
+          <li>Se borra el usuario de Auth al final. No es reversible y no es masivo.</li>
+        </ul>
+        <input value={phrase} onChange={(e) => setPhrase(e.target.value)} placeholder='Escribe: "Eliminar permanentemente datos y cuenta"' className="w-full bg-[#0D0D12] border border-white/10 text-white rounded-xl px-3 py-2.5 text-sm" />
+        <input value={confirmEmail} onChange={(e) => setConfirmEmail(e.target.value)} placeholder={`Escribe el email exacto: ${user.email}`} className="w-full bg-[#0D0D12] border border-white/10 text-white rounded-xl px-3 py-2.5 text-sm" />
+        <button onClick={doDelete} disabled={!confirmed || busy || !accessToken} className="w-full py-2.5 rounded-xl text-sm font-bold bg-red-600 text-white hover:bg-red-700 disabled:opacity-40 disabled:cursor-not-allowed">
+          {busy ? "Eliminando…" : "Eliminar permanentemente"}
+        </button>
+        <button onClick={onClose} className="w-full text-xs text-gray-500 hover:text-white">Cancelar</button>
+      </div>
+    </div>
+  );
+}
+
+// ─── Admin: Usuarios y trials (solo admin) ───────────────────────────────────
 function AdminDashboard({ accessToken, profile }: { accessToken?: string; profile: UserProfile | null }) {
   const isAdmin = profile?.role === "admin";
   const [users, setUsers] = useState<UserProfile[]>([]);
   const [integrations, setIntegrations] = useState<IntegrationConfig[]>([]);
   const [subscriptions, setSubscriptions] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
+  const [search, setSearch] = useState("");
   const [nuEmail, setNuEmail] = useState("");
   const [nuPass, setNuPass] = useState("");
   const [nuDays, setNuDays] = useState(14);
   const [msg, setMsg] = useState("");
   const [err, setErr] = useState("");
+  const [trialUser, setTrialUser] = useState<UserProfile | null>(null);
+  const [suspendUser, setSuspendUser] = useState<UserProfile | null>(null);
+  const [auditUser, setAuditUser] = useState<UserProfile | null>(null);
+  const [deleteUser, setDeleteUser] = useState<UserProfile | null>(null);
+  const [deleteCounts, setDeleteCounts] = useState<Record<string, number>>({});
+  const [allAudit, setAllAudit] = useState<any[]>([]);
+  const [showAllAudit, setShowAllAudit] = useState(false);
+
+  const notify = (m: string, isErr?: boolean) => { if (isErr) setErr(m); else setMsg(m); };
+  const loadUsers = async (q?: string) => {
+    if (!accessToken) return;
+    const res = await api.getUsers(accessToken, q ?? search);
+    setUsers(res?.users ?? []);
+  };
 
   useEffect(() => {
     if (!isAdmin || !accessToken) return;
@@ -3302,8 +3425,14 @@ function AdminDashboard({ accessToken, profile }: { accessToken?: string; profil
       const res = await api.adminCreateUser(accessToken, { email: nuEmail.trim(), password: nuPass, trialDays: nuDays });
       setMsg(res?.alreadyExisted ? `El usuario ya existía: se actualizó su trial a ${res.trialDays} días (no se duplicó).` : `Usuario creado con trial de ${res?.trialDays} días.`);
       setNuEmail(""); setNuPass("");
-      const u = await api.getUsers(accessToken); setUsers(u?.users ?? []);
+      await loadUsers();
     } catch (e: any) { setErr(e.message); }
+  };
+
+  const runAction = async (fn: () => Promise<void>) => {
+    setMsg(""); setErr("");
+    try { await fn(); await loadUsers(); }
+    catch (e: any) { setErr(e.message); }
   };
 
   const saveIntegration = async (id: string, enabled: boolean) => {
@@ -3327,41 +3456,102 @@ function AdminDashboard({ accessToken, profile }: { accessToken?: string; profil
     setIntegrations(res?.integrations ?? []);
   };
 
+  const openDelete = (u: UserProfile) => {
+    setDeleteCounts(u.dataSummary ? { app_data: u.dataSummary.appData, user_entities: u.dataSummary.entities, user_settings: u.dataSummary.settings } : {});
+    setDeleteUser(u);
+  };
+
+  const accessColor = (s?: string) => s === "active" ? "green" : s === "trial" ? "yellow" : s === "suspended" ? "red" : s === "revoked" ? "gray" : "gray";
+  const accessLabel = (u: UserProfile) => {
+    if (u.role === "admin") return "active";
+    return u.access_status ?? u.subscription_status ?? "unknown";
+  };
+
+  const reloadAudit = async () => {
+    if (!accessToken) return;
+    const res = await api.adminListAudit(accessToken);
+    setAllAudit(res?.audit ?? []);
+  };
+
   return (
     <div className="space-y-5">
       <div className="bg-gradient-to-r from-[#9D4EDD]/20 to-[#3B82F6]/10 border border-[#9D4EDD]/20 rounded-2xl p-5 flex items-center gap-3">
         <div className="w-12 h-12 rounded-2xl bg-[#9D4EDD]/20 flex items-center justify-center"><ShieldCheck size={24} className="text-[#c084fc]" /></div>
         <div>
-          <p className="text-white font-bold text-lg">Dashboard de Administración</p>
-          <p className="text-gray-400 text-sm">Gestión de usuarios, trials, suscripciones e integraciones · {profile?.email}</p>
+          <p className="text-white font-bold text-lg">Admin · Usuarios y trials</p>
+          <p className="text-gray-400 text-sm">Acceso ≠ datos: cambiar trial/suspender nunca toca los datos del usuario · {profile?.email}</p>
         </div>
       </div>
 
       {err && <p className="text-xs text-red-400 bg-red-500/10 border border-red-500/20 rounded-xl px-3 py-2">{err}</p>}
       {msg && <p className="text-xs text-emerald-400 bg-emerald-500/10 border border-emerald-500/20 rounded-xl px-3 py-2">{msg}</p>}
 
-      {/* Usuarios + trial */}
+      {/* Usuarios */}
       <Card>
         <div className="flex items-center gap-2 mb-4"><Users size={15} className="text-[#c084fc]" /><p className="text-xs text-gray-500 uppercase tracking-wider">Gestión de usuarios y trials</p></div>
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-2 mb-3">
-          <input value={nuEmail} onChange={e => setNuEmail(e.target.value)} placeholder="Email del usuario" className="bg-[#0D0D12] border border-white/10 text-white rounded-xl px-3 py-2.5 text-sm" />
-          <input value={nuPass} onChange={e => setNuPass(e.target.value)} placeholder="Contraseña temporal" className="bg-[#0D0D12] border border-white/10 text-white rounded-xl px-3 py-2.5 text-sm" />
+        <div className="flex flex-col md:flex-row gap-2 mb-3">
+          <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Buscar por email…" className="flex-1 bg-[#0D0D12] border border-white/10 text-white rounded-xl px-3 py-2.5 text-sm" />
+          <button onClick={() => loadUsers()} className="px-4 py-2.5 rounded-xl text-sm font-medium bg-white/5 border border-white/10 text-gray-300 hover:bg-white/10">Buscar</button>
+        </div>
+        <div className="grid grid-cols-1 md:grid-cols-4 gap-2 mb-3">
+          <input value={nuEmail} onChange={(e) => setNuEmail(e.target.value)} placeholder="Email del nuevo usuario" className="bg-[#0D0D12] border border-white/10 text-white rounded-xl px-3 py-2.5 text-sm md:col-span-2" />
+          <input value={nuPass} onChange={(e) => setNuPass(e.target.value)} placeholder="Contraseña temporal" className="bg-[#0D0D12] border border-white/10 text-white rounded-xl px-3 py-2.5 text-sm" />
           <div className="flex gap-2">
-            <input type="number" min="1" value={nuDays} onChange={e => setNuDays(Number(e.target.value))} className="w-24 bg-[#0D0D12] border border-white/10 text-white rounded-xl px-3 py-2.5 text-sm" />
-            <button onClick={createUser} className="flex-1 py-2.5 bg-[#9D4EDD] text-white rounded-xl text-sm font-medium hover:bg-[#7B2CBF]">Crear / asignar trial</button>
+            <input type="number" min="1" value={nuDays} onChange={(e) => setNuDays(Number(e.target.value))} className="w-20 bg-[#0D0D12] border border-white/10 text-white rounded-xl px-3 py-2.5 text-sm" />
+            <button onClick={createUser} className="flex-1 py-2.5 bg-[#9D4EDD] text-white rounded-xl text-sm font-medium hover:bg-[#7B2CBF]">Crear / invitar</button>
           </div>
         </div>
-        <div className="max-h-64 overflow-auto space-y-2">
-          {loading ? <p className="text-gray-600 text-sm">Cargando usuarios…</p> : users.map(u => (
-            <div key={u.id} className="rounded-xl bg-[#0D0D12] border border-white/5 p-2.5 text-xs text-gray-300 flex items-center justify-between">
-              <div>
-                <div className="font-medium text-white">{u.email}</div>
-                <div className="mt-1 text-gray-500">{u.role} · {u.subscription_status} · {u.trial_days ?? 14} días · trial hasta {u.trial_end ? new Date(u.trial_end).toLocaleDateString("es-MX") : "—"}</div>
+
+        <div className="space-y-2">
+          {loading ? <p className="text-gray-600 text-sm">Cargando usuarios…</p> : users.map(u => {
+            const isSelf = u.id === profile?.id;
+            const countsTotal = (u.dataSummary?.appData ?? 0) + (u.dataSummary?.entities ?? 0) + (u.dataSummary?.settings ?? 0);
+            return (
+              <div key={u.id} className="rounded-xl bg-[#0D0D12] border border-white/5 p-3 text-xs text-gray-300">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="min-w-0">
+                    <div className="font-medium text-white truncate">{u.email} {isSelf && <span className="text-[#c084fc]">(tú)</span>}</div>
+                    <div className="mt-1 text-gray-500 flex flex-wrap gap-x-3 gap-y-0.5">
+                      <span>rol: {u.role}</span>
+                      <span>acceso: <span className="text-white">{accessLabel(u)}</span></span>
+                      <span>{u.trial_days ?? 14} días</span>
+                      <span>trial hasta {u.trial_end ? new Date(u.trial_end).toLocaleDateString("es-MX") : "—"}</span>
+                      <span>último acceso: {u.lastSignInAt ? new Date(u.lastSignInAt).toLocaleDateString("es-MX") : "—"}</span>
+                      <span>creado: {u.authCreatedAt ? new Date(u.authCreatedAt).toLocaleDateString("es-MX") : new Date(u.created_at).toLocaleDateString("es-MX")}</span>
+                      <span>datos: <span className="text-white">{countsTotal}</span></span>
+                    </div>
+                    {u.access_status === "suspended" && u.suspension_reason && <div className="mt-1 text-amber-400">Motivo: {u.suspension_reason}</div>}
+                  </div>
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <Bdg color={accessColor(accessLabel(u))}>{accessLabel(u)}</Bdg>
+                    {u.role !== "admin" && (
+                      <>
+                        <button onClick={() => setTrialUser(u)} className="px-2.5 py-1.5 rounded-lg text-[11px] font-medium bg-white/5 border border-white/10 text-gray-300 hover:bg-[#9D4EDD]/20">Trial</button>
+                        <button onClick={() => runAction(() => api.adminActivateAccess(accessToken!, { userId: u.id }))} disabled={!accessToken} className="px-2.5 py-1.5 rounded-lg text-[11px] font-medium bg-emerald-500/10 border border-emerald-500/25 text-emerald-400 hover:bg-emerald-500/20 disabled:opacity-40">Activar</button>
+                        <button onClick={() => setSuspendUser(u)} className="px-2.5 py-1.5 rounded-lg text-[11px] font-medium bg-amber-500/10 border border-amber-500/25 text-amber-400 hover:bg-amber-500/20">Suspender</button>
+                        <button onClick={() => runAction(() => api.adminRevokeAccess(accessToken!, { userId: u.id }))} disabled={!accessToken} className="px-2.5 py-1.5 rounded-lg text-[11px] font-medium bg-white/5 border border-white/10 text-gray-400 hover:bg-white/10 disabled:opacity-40">Revocar</button>
+                        <button onClick={() => openDelete(u)} disabled={!accessToken} className="px-2.5 py-1.5 rounded-lg text-[11px] font-medium bg-red-500/10 border border-red-500/25 text-red-400 hover:bg-red-500/20 disabled:opacity-40">Eliminar</button>
+                      </>
+                    )}
+                    <button onClick={() => { setAuditUser(u); }} className="px-2.5 py-1.5 rounded-lg text-[11px] font-medium bg-white/5 border border-white/10 text-gray-400 hover:bg-white/10"><History size={11} className="inline mr-1" />Auditoría</button>
+                  </div>
+                </div>
               </div>
-              <Bdg color={u.subscription_status === "active" ? "green" : u.subscription_status === "trial" ? "yellow" : "red"}>{u.subscription_status}</Bdg>
-            </div>
-          ))}
+            );
+          })}
         </div>
+        <button onClick={async () => { await reloadAudit(); setShowAllAudit(!showAllAudit); }} className="mt-3 text-xs text-[#c084fc] hover:text-[#9D4EDD] flex items-center gap-1"><History size={12} /> {showAllAudit ? "Ocultar auditoría global" : "Ver auditoría global"}</button>
+        {showAllAudit && (
+          <div className="mt-2 space-y-2 max-h-64 overflow-auto">
+            {allAudit.length === 0 && <p className="text-gray-600 text-sm">Sin acciones administrativas registradas.</p>}
+            {allAudit.map(r => (
+              <div key={r.id} className="rounded-xl bg-[#0D0D12] border border-white/5 p-2 text-[11px] text-gray-400">
+                <span className="text-[#c084fc] font-medium">{r.action}</span> · target {r.target_user_id?.slice(0, 8) ?? "—"} · {new Date(r.created_at).toLocaleString("es-MX")}
+                {r.reason && <div className="text-gray-600">Motivo: {r.reason}</div>}
+              </div>
+            ))}
+          </div>
+        )}
       </Card>
 
       {/* Integraciones */}
@@ -3406,6 +3596,11 @@ function AdminDashboard({ accessToken, profile }: { accessToken?: string; profil
           ))}
         </div>
       </Card>
+
+      {trialUser && <AdminTrialModal user={trialUser} accessToken={accessToken} onClose={() => setTrialUser(null)} onDone={loadUsers} notify={notify} />}
+      {suspendUser && <AdminSuspendModal user={suspendUser} accessToken={accessToken} onClose={() => setSuspendUser(null)} onDone={loadUsers} notify={notify} />}
+      {auditUser && <AdminAuditModal userId={auditUser.id} email={auditUser.email} accessToken={accessToken} onClose={() => setAuditUser(null)} />}
+      {deleteUser && <AdminDeleteModal user={deleteUser} counts={deleteCounts} accessToken={accessToken} onClose={() => setDeleteUser(null)} onDone={loadUsers} notify={notify} />}
     </div>
   );
 }
@@ -3480,6 +3675,42 @@ function useNewAppVersion(enabled: boolean): boolean {
   return newVersion;
 }
 
+// ─── Pantalla de acceso bloqueado (trial vencido / suspendido / revocado) ────
+// Muestra un estado claro sin borrar ni inicializar datos del usuario.
+function AccessBlockedScreen({ state, end, reason, onRetry }: {
+  state: string; end: string | null; reason: string | null; onRetry: () => void;
+}) {
+  const expired = state === "trial" && end && new Date(end).getTime() <= Date.now();
+  const title = state === "suspended" ? "Tu acceso fue suspendido"
+    : state === "revoked" ? "Tu acceso fue revocado"
+    : expired ? "Tu periodo de prueba terminó"
+    : "No pudimos verificar tu acceso";
+  const detail = state === "suspended"
+    ? `Suspensión${reason ? `: ${reason}` : " temporal"}. Tus datos están a salvo y se conservan.`
+    : state === "revoked"
+      ? "Tu acceso fue revocado. Tus datos se conservan."
+      : expired
+        ? "Tu periodo de prueba terminó. Contacta al administrador para renovar tu acceso; tus datos están a salvo."
+        : "No pudimos confirmar tu estado de acceso. Reintenta en unos momentos; no se han tocado tus datos.";
+
+  return (
+    <div className="min-h-screen bg-[#0B0B0E] text-white flex items-center justify-center px-6" style={{ fontFamily: "'Inter',sans-serif" }}>
+      <div className="max-w-md w-full text-center space-y-4">
+        <div className="w-14 h-14 rounded-2xl bg-amber-500/15 border border-amber-500/25 flex items-center justify-center mx-auto"><Lock size={24} className="text-amber-400" /></div>
+        <p className="text-white font-semibold text-lg">{title}</p>
+        <p className="text-gray-500 text-sm">{detail}</p>
+        {expired && (
+          <a href="mailto:octaface@gmail.com?subject=Trial%20Momentum90" className="inline-block rounded-xl bg-[#9D4EDD] hover:bg-[#7B2CBF] text-white text-sm font-semibold px-5 py-2.5 transition-all">Contactar al administrador</a>
+        )}
+        {!expired && (
+          <button onClick={onRetry} className="rounded-xl bg-[#9D4EDD] hover:bg-[#7B2CBF] text-white text-sm font-semibold px-5 py-2.5 transition-all">Reintentar</button>
+        )}
+        <button onClick={() => supabase.auth.signOut().catch(() => {})} className="block mx-auto text-xs text-gray-600 hover:text-white">Cerrar sesión</button>
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   // Guardia constante: si faltan las variables de Supabase, mostramos un aviso
   // en lugar de quedarnos en negro (nunca lanzamos en el import).
@@ -3488,6 +3719,7 @@ export default function App() {
   const [data, setData] = useState<AppState>(INIT);
   const [session, setSession] = useState<any>(null);
   const [profile, setProfile] = useState<UserProfile | null>(null);
+  const [profileLoading, setProfileLoading] = useState(true);
   const [authLoading, setAuthLoading] = useState(true);
   const [userEmail, setUserEmail] = useState("");
   const [tab, setTab] = useState<AppTab>("dashboard");
@@ -3590,14 +3822,16 @@ export default function App() {
   useEffect(() => {
     if (!session?.user?.id || !session?.access_token) {
       setProfile(null);
+      setProfileLoading(false);
       return;
     }
+    setProfileLoading(true);
     (async () => {
       const fresh = await getFreshSession();
-      if (!fresh?.access_token) { setProfile(null); return; }
+      if (!fresh?.access_token) { setProfile(null); setProfileLoading(false); return; }
       api.getProfile(fresh.access_token)
-        .then((res) => setProfile(res?.profile ?? null))
-        .catch(() => setProfile(null));
+        .then((res) => { setProfile(res?.profile ?? null); setProfileLoading(false); })
+        .catch(() => { setProfile(null); setProfileLoading(false); });
     })();
   }, [session?.user?.id, session?.access_token]);
 
@@ -3974,6 +4208,40 @@ export default function App() {
   // Pantalla de login/registro
   if (!session) return <AuthScreen />;
 
+  // ── Gate de acceso (separación: acceso ≠ datos personales) ────────────────
+  // Admin siempre entra; active y trial vigente entran; suspendido/revocado o
+  // trial vencido ven una pantalla de bloqueo. NUNCA se borran ni se inicializan
+  // datos del usuario aquí, y el estado vacío nunca sobrescribe datos reales.
+  const accessOk = canAccess(profile);
+  const accessState = profile?.access_status ?? profile?.subscription_status ?? "unknown";
+  const accessEnd = profile?.trial_end ?? profile?.subscription_expires_at ?? null;
+
+  if (profileLoading) {
+    return (
+      <div className="min-h-screen bg-[#0B0B0E] flex items-center justify-center" style={{ fontFamily: "'Inter',sans-serif" }}>
+        <p className="text-gray-500 text-sm">Verificando tu acceso…</p>
+      </div>
+    );
+  }
+
+  if (!accessOk) {
+    return (
+      <AccessBlockedScreen
+        state={accessState}
+        end={accessEnd}
+        reason={profile?.suspension_reason ?? null}
+        onRetry={() => {
+          setProfileLoading(true);
+          const t = session?.access_token;
+          if (!t) { setProfileLoading(false); return; }
+          api.getProfile(t)
+            .then((r) => { setProfile(r?.profile ?? null); setProfileLoading(false); })
+            .catch(() => { setProfile(null); setProfileLoading(false); });
+        }}
+      />
+    );
+  }
+
   // Si la carga falló: bloqueamos el uso y mostramos el error. Nunca guardamos
   // (loadedRef=false) y nunca reemplazamos datos existentes con INIT vacío.
   if (loadState === "error") {
@@ -4027,7 +4295,7 @@ export default function App() {
               <p className="text-white font-bold">Configuración</p>
               <button onClick={() => setShowSettings(false)} className="text-gray-500 hover:text-white" aria-label="Cerrar configuración"><X size={16} /></button>
             </div>
-            <SettingsPanel userEmail={userEmail} onLogout={handleLogout} profile={profile} accessToken={session?.access_token} />
+            <SettingsPanel userEmail={userEmail} onLogout={handleLogout} profile={profile} accessToken={session?.access_token} onOpenAdmin={() => { setShowSettings(false); setTab("admin"); }} />
           </div>
         </div>
       )}

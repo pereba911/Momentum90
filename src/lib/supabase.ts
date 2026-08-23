@@ -39,6 +39,16 @@ export interface UserProfile {
   stripe_customer_id?: string;
   stripe_subscription_id?: string;
   created_at: string;
+  // Administración de acceso (separación: acceso ≠ datos personales)
+  access_status?: "active" | "trial" | "suspended" | "revoked";
+  suspended_at?: string | null;
+  suspension_reason?: string | null;
+  access_updated_at?: string | null;
+  access_updated_by?: string | null;
+  // Enriquecimiento del panel admin (GET /users)
+  authCreatedAt?: string | null;
+  lastSignInAt?: string | null;
+  dataSummary?: { entities: number; appData: number; settings: number };
 }
 
 export interface UserSettings {
@@ -137,7 +147,13 @@ export const api = {
   saveEntity: <T = unknown>(t: string, entity: AppEntityName, items: T[]) => apiCall(t, "POST", `/entities/${entity}`, { entity, items }),
   getSettings: (t: string) => apiCall(t, "GET", "/settings"),
   saveSettings: (t: string, settings: UserSettings) => apiCall(t, "POST", "/settings", { settings }),
-  getUsers: (t: string) => apiCall(t, "GET", "/users"),
+  getUsers: (t: string, search?: string) => apiCall(t, "GET", `/users${search ? `?search=${encodeURIComponent(search)}` : ""}`),
+  adminSetTrial: (t: string, payload: { userId: string; trialEnd?: string; trialDays?: number; reason?: string }) => apiCall(t, "POST", "/admin/trial", payload),
+  adminActivateAccess: (t: string, payload: { userId: string; reason?: string }) => apiCall(t, "POST", "/admin/access/activate", payload),
+  adminSuspendAccess: (t: string, payload: { userId: string; reason: string }) => apiCall(t, "POST", "/admin/access/suspend", payload),
+  adminRevokeAccess: (t: string, payload: { userId: string; reason?: string }) => apiCall(t, "POST", "/admin/access/revoke", payload),
+  adminDeleteUser: (t: string, payload: { userId: string; confirmEmail: string }) => apiCall(t, "POST", "/admin/users/delete", payload),
+  adminListAudit: (t: string, targetUserId?: string) => apiCall(t, "GET", `/admin/audit${targetUserId ? `?targetUserId=${encodeURIComponent(targetUserId)}` : ""}`),
   updateUser: (t: string, userId: string, updates: Partial<UserProfile>) => apiCall(t, "PUT", `/profile/${userId}`, updates),
   adminCreateUser: (t: string, payload: { email: string; password: string; trialDays: number; role?: "admin" | "user" }) => apiCall(t, "POST", "/admin/users", payload),
   adminListIntegrations: (t: string) => apiCall(t, "GET", "/admin/integrations"),
@@ -152,16 +168,19 @@ export function getAccessToken(session: { access_token?: string } | null): strin
 }
 
 export function getDaysLeft(profile: UserProfile | null): number {
-  if (!profile || profile.role === "admin" || profile.subscription_status === "active") return Infinity;
-  if (!profile.subscription_expires_at) return 0;
-  const diff = new Date(profile.subscription_expires_at).getTime() - Date.now();
-  return Math.max(0, Math.ceil(diff / 86400000));
+  if (!profile) return 0;
+  if (profile.role === "admin" || profile.access_status === "active" || profile.subscription_status === "active") return Infinity;
+  if (profile.access_status === "suspended" || profile.access_status === "revoked") return 0;
+  const end = profile.trial_end || profile.subscription_expires_at;
+  if (!end) return Infinity; // trial sin fecha de fin configurada: no se puede probar vencimiento
+  return Math.max(0, Math.ceil((new Date(end).getTime() - Date.now()) / 86400000));
 }
 
 export function canAccess(profile: UserProfile | null): boolean {
   if (!profile) return false;
   if (profile.role === "admin") return true;
-  if (profile.subscription_status === "active") return true;
-  if (profile.subscription_status === "trial" && getDaysLeft(profile) > 0) return true;
+  if (profile.access_status === "suspended" || profile.access_status === "revoked") return false;
+  if (profile.access_status === "active" || profile.subscription_status === "active") return true;
+  if (profile.access_status === "trial" || profile.subscription_status === "trial") return getDaysLeft(profile) > 0;
   return false;
 }

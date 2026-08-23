@@ -173,6 +173,104 @@ async function createStripeCustomer(email: string, userId: string) {
   return json.id as string;
 }
 
+// ── Helpers seguros de administración (solo servidor) ─────────────────────────
+// Estas funciones NUNCA exponen service role al frontend: el cliente solo puede
+// llamar a las rutas /admin/* con su JWT; aquí se valida rol admin en servidor.
+
+async function requireAdmin(authHeader: string | undefined) {
+  const user = await getUser(authHeader);
+  if (!user) return { error: { status: 401, body: { error: "Unauthorized" } } };
+  const profile = await ensureProfile(user);
+  if (profile.role !== "admin") return { error: { status: 403, body: { error: "Forbidden" } } };
+  return { user, profile };
+}
+
+async function getProfileById(id: string) {
+  const { data, error } = await adminClient()
+    .from("user_profiles")
+    .select("*")
+    .eq("id", id)
+    .maybeSingle();
+  if (error) throw new Error(error.message);
+  return data ?? null;
+}
+
+function pickAccess(p: any) {
+  return {
+    role: p?.role ?? null,
+    access_status: p?.access_status ?? null,
+    subscription_status: p?.subscription_status ?? null,
+    trial_start: p?.trial_start ?? null,
+    trial_end: p?.trial_end ?? null,
+    trial_days: p?.trial_days ?? null,
+    subscription_expires_at: p?.subscription_expires_at ?? null,
+    suspended_at: p?.suspended_at ?? null,
+    suspension_reason: p?.suspension_reason ?? null,
+  };
+}
+
+// Auditoría administrativa (nueva tabla admin_audit_log, solo service role).
+async function writeAdminAudit(
+  adminId: string,
+  targetId: string | null,
+  action: string,
+  before: unknown,
+  after: unknown,
+  reason?: string
+) {
+  const { error } = await adminClient().from("admin_audit_log").insert({
+    admin_user_id: adminId,
+    target_user_id: targetId,
+    action,
+    before_state: before ?? null,
+    after_state: after ?? null,
+    reason: reason ?? null,
+  });
+  if (error) console.warn("admin_audit_log write skipped:", error.message);
+}
+
+// Tablas con columna user_id que pueden contener dependencias de un usuario.
+const USER_DATA_TABLES = [
+  "user_settings", "user_entities", "app_data", "integrations", "subscriptions",
+  "incomes", "expenses", "recurring_expenses", "debts", "goals", "tasks",
+  "task_completions", "assets", "deals", "pipelines", "goal_contributions",
+  "achievements", "quarterly_progress", "annual_progress",
+  "financial_accounts", "financial_transactions", "financial_allocations",
+] as const;
+
+async function countUserData(userId: string) {
+  const counts: Record<string, number> = {};
+  for (const table of USER_DATA_TABLES) {
+    const { count, error } = await adminClient()
+      .from(table)
+      .select("user_id", { count: "exact", head: true })
+      .eq("user_id", userId);
+    if (error) { counts[table] = -1; continue; }
+    counts[table] = count ?? 0;
+  }
+  return counts;
+}
+
+// Borrado por usuario (NUNCA masivo): elimina dependencias del user_id objetivo.
+// user_roles y user_profiles se borran aquí explícitamente; el Auth user se borra
+// al final (admin.deleteUser), cuyos CASCADE limpian identities/sessions/mfa.
+async function deleteUserData(userId: string) {
+  for (const table of USER_DATA_TABLES) {
+    const { error } = await adminClient().from(table).delete().eq("user_id", userId);
+    if (error) console.warn(`delete ${table} skipped:`, error.message);
+  }
+  const { error: rolesErr } = await adminClient().from("user_roles").delete().eq("user_id", userId);
+  if (rolesErr) console.warn("delete user_roles skipped:", rolesErr.message);
+  const { error: profErr } = await adminClient().from("user_profiles").delete().eq("id", userId);
+  if (profErr) console.warn("delete user_profiles skipped:", profErr.message);
+  // Referencias de auditoría previas apuntando al usuario (huérfanas).
+  const { error: audErr } = await adminClient()
+    .from("audit_log")
+    .delete()
+    .or(`user_id.eq.${userId},entity_id.eq.${userId}`);
+  if (audErr) console.warn("delete audit refs skipped:", audErr.message);
+}
+
 // ── Health ────────────────────────────────────────────────────────────────────
 app.get("/make-server-da3143e6/health", (c) => c.json({ status: "ok" }));
 
@@ -560,19 +658,257 @@ app.post("/make-server-da3143e6/stripe/webhook", async (c) => {
 });
 
 app.get("/make-server-da3143e6/users", async (c) => {
-  const user = await getUser(c.req.header("Authorization"));
-  if (!user) return c.json({ error: "Unauthorized" }, 401);
+  const auth = await requireAdmin(c.req.header("Authorization"));
+  if (auth.error) return c.json(auth.error.body, auth.error.status);
 
-  const myProfile = await ensureProfile(user);
-  if (myProfile.role !== "admin") return c.json({ error: "Forbidden" }, 403);
-
+  const q = String(c.req.query("search") ?? "").trim().toLowerCase();
   const { data: profiles, error } = await adminClient()
     .from("user_profiles")
     .select("*")
     .order("created_at", { ascending: false });
-
   if (error) throw new Error(error.message);
-  return c.json({ users: profiles ?? [] });
+
+  // Conteos de datos por usuario (sin exponer datos financieros sensibles).
+  const { data: entities } = await adminClient().from("user_entities").select("user_id");
+  const { data: appData } = await adminClient().from("app_data").select("user_id");
+  const { data: settings } = await adminClient().from("user_settings").select("user_id");
+  const countBy = (rows: any[] | null, key: string) => {
+    const m: Record<string, number> = {};
+    (rows ?? []).forEach((r) => { m[r[key]] = (m[r[key]] ?? 0) + 1; });
+    return m;
+  };
+  const entityCount = countBy(entities, "user_id");
+  const appDataCount = countBy(appData, "user_id");
+  const settingsCount = countBy(settings, "user_id");
+
+  // Fechas de auth (created_at / last_sign_in_at).
+  const authByEmail: Record<string, any> = {};
+  for (let page = 1; page <= 50; page++) {
+    const { data: pageData, error: listError } = await adminClient().auth.admin.listUsers({ page, perPage: 200 });
+    if (listError) break;
+    const users = pageData?.users ?? [];
+    users.forEach((u: any) => { authByEmail[String(u.email ?? "").toLowerCase()] = u; });
+    if (users.length < 200) break;
+  }
+
+  const users = (profiles ?? [])
+    .map((p: any) => {
+      const au = authByEmail[String(p.email ?? "").toLowerCase()];
+      return {
+        ...p,
+        authCreatedAt: au?.created_at ?? null,
+        lastSignInAt: au?.last_sign_in_at ?? null,
+        dataSummary: {
+          entities: entityCount[p.id] ?? 0,
+          appData: appDataCount[p.id] ?? 0,
+          settings: settingsCount[p.id] ?? 0,
+        },
+      };
+    })
+    .filter((p: any) => !q || String(p.email ?? "").toLowerCase().includes(q));
+
+  return c.json({ users });
+});
+
+// ── Admin: asignar/editar trial (fecha exacta o duración rápida) ──────────────
+app.post("/make-server-da3143e6/admin/trial", async (c) => {
+  const auth = await requireAdmin(c.req.header("Authorization"));
+  if (auth.error) return c.json(auth.error.body, auth.error.status);
+  const admin = auth.profile;
+
+  const body = await c.req.json();
+  const targetId = String(body?.userId ?? "").trim();
+  if (!targetId) return c.json({ error: "userId es requerido" }, 400);
+
+  const target = await getProfileById(targetId);
+  if (!target) return c.json({ error: "Usuario no encontrado" }, 404);
+  if (target.role === "admin") return c.json({ error: "No se modifican trials de admins" }, 400);
+
+  let trialEnd: Date;
+  if (body?.trialEnd) {
+    const d = new Date(String(body.trialEnd));
+    if (isNaN(d.getTime())) return c.json({ error: "Fecha de fin de trial inválida" }, 400);
+    trialEnd = d;
+  } else {
+    const days = Math.max(1, Number(body?.trialDays ?? 14));
+    trialEnd = new Date(Date.now() + days * 86400000);
+  }
+
+  const days = body?.trialDays ? Math.max(1, Number(body.trialDays)) : Math.max(1, Math.round((trialEnd.getTime() - Date.now()) / 86400000));
+  const nowIso = new Date().toISOString();
+  const oldEnd = target.trial_end ? new Date(target.trial_end) : null;
+  const action = !target.trial_end
+    ? "trial_created"
+    : trialEnd.getTime() > oldEnd!.getTime() ? "trial_extended" : "trial_shortened";
+
+  const before = pickAccess(target);
+  const { error } = await adminClient().from("user_profiles").update({
+    trial_start: target.trial_start ?? nowIso,
+    trial_end: trialEnd.toISOString(),
+    trial_days: days,
+    subscription_status: "trial",
+    subscription_expires_at: trialEnd.toISOString(),
+    access_status: "trial",
+    suspended_at: null,
+    suspension_reason: null,
+    access_updated_at: nowIso,
+    access_updated_by: admin.id,
+    updated_at: nowIso,
+  }).eq("id", targetId);
+  if (error) throw new Error(error.message);
+
+  const after = { ...before, trial_end: trialEnd.toISOString(), trial_days: days, access_status: "trial" };
+  await writeAdminAudit(admin.id, targetId, action, before, after, body?.reason);
+  return c.json({ success: true, action, trialEnd: trialEnd.toISOString(), trialDays: days });
+});
+
+// ── Admin: activar / suspender / revocar acceso ───────────────────────────────
+app.post("/make-server-da3143e6/admin/access/activate", async (c) => {
+  const auth = await requireAdmin(c.req.header("Authorization"));
+  if (auth.error) return c.json(auth.error.body, auth.error.status);
+  const admin = auth.profile;
+  const body = await c.req.json();
+  const targetId = String(body?.userId ?? "").trim();
+  if (!targetId) return c.json({ error: "userId es requerido" }, 400);
+  const target = await getProfileById(targetId);
+  if (!target) return c.json({ error: "Usuario no encontrado" }, 404);
+  if (target.role === "admin") return c.json({ error: "Los admins siempre tienen acceso" }, 400);
+
+  const before = pickAccess(target);
+  const nowIso = new Date().toISOString();
+  const { error } = await adminClient().from("user_profiles").update({
+    access_status: "active",
+    subscription_status: "active",
+    suspended_at: null,
+    suspension_reason: null,
+    access_updated_at: nowIso,
+    access_updated_by: admin.id,
+    updated_at: nowIso,
+  }).eq("id", targetId);
+  if (error) throw new Error(error.message);
+
+  const after = { ...before, access_status: "active", subscription_status: "active", suspended_at: null, suspension_reason: null };
+  await writeAdminAudit(admin.id, targetId, "access_activated", before, after, body?.reason);
+  return c.json({ success: true });
+});
+
+app.post("/make-server-da3143e6/admin/access/suspend", async (c) => {
+  const auth = await requireAdmin(c.req.header("Authorization"));
+  if (auth.error) return c.json(auth.error.body, auth.error.status);
+  const admin = auth.profile;
+  const body = await c.req.json();
+  const targetId = String(body?.userId ?? "").trim();
+  if (!targetId) return c.json({ error: "userId es requerido" }, 400);
+  const reason = String(body?.reason ?? "").trim();
+  if (!reason) return c.json({ error: "El motivo de suspensión es requerido" }, 400);
+  const target = await getProfileById(targetId);
+  if (!target) return c.json({ error: "Usuario no encontrado" }, 404);
+  if (target.role === "admin") return c.json({ error: "Los admins no se suspenden" }, 400);
+
+  const before = pickAccess(target);
+  const nowIso = new Date().toISOString();
+  const { error } = await adminClient().from("user_profiles").update({
+    access_status: "suspended",
+    suspended_at: nowIso,
+    suspension_reason: reason,
+    access_updated_at: nowIso,
+    access_updated_by: admin.id,
+    updated_at: nowIso,
+  }).eq("id", targetId);
+  if (error) throw new Error(error.message);
+
+  const after = { ...before, access_status: "suspended", suspended_at: nowIso, suspension_reason: reason };
+  await writeAdminAudit(admin.id, targetId, "access_suspended", before, after, reason);
+  return c.json({ success: true });
+});
+
+app.post("/make-server-da3143e6/admin/access/revoke", async (c) => {
+  const auth = await requireAdmin(c.req.header("Authorization"));
+  if (auth.error) return c.json(auth.error.body, auth.error.status);
+  const admin = auth.profile;
+  const body = await c.req.json();
+  const targetId = String(body?.userId ?? "").trim();
+  if (!targetId) return c.json({ error: "userId es requerido" }, 400);
+  const reason = String(body?.reason ?? "").trim() || null;
+  const target = await getProfileById(targetId);
+  if (!target) return c.json({ error: "Usuario no encontrado" }, 404);
+  if (target.role === "admin") return c.json({ error: "Los admins no se revocan" }, 400);
+
+  const before = pickAccess(target);
+  const nowIso = new Date().toISOString();
+  const { error } = await adminClient().from("user_profiles").update({
+    access_status: "revoked",
+    suspended_at: nowIso,
+    suspension_reason: reason,
+    access_updated_at: nowIso,
+    access_updated_by: admin.id,
+    updated_at: nowIso,
+  }).eq("id", targetId);
+  if (error) throw new Error(error.message);
+
+  const after = { ...before, access_status: "revoked", suspended_at: nowIso, suspension_reason: reason };
+  await writeAdminAudit(admin.id, targetId, "access_revoked", before, after, reason ?? undefined);
+  return c.json({ success: true });
+});
+
+// ── Admin: eliminar usuario (flujo de alto riesgo, NUNCA masivo) ──────────────
+app.post("/make-server-da3143e6/admin/users/delete", async (c) => {
+  const auth = await requireAdmin(c.req.header("Authorization"));
+  if (auth.error) return c.json(auth.error.body, auth.error.status);
+  const admin = auth.profile;
+
+  const body = await c.req.json();
+  const targetId = String(body?.userId ?? "").trim();
+  if (!targetId) return c.json({ error: "userId es requerido" }, 400);
+
+  const target = await getProfileById(targetId);
+  if (!target) return c.json({ error: "Usuario no encontrado" }, 404);
+
+  // Confirmación explícita: el admin debe escribir el email exacto del objetivo.
+  const confirmEmail = String(body?.confirmEmail ?? "").trim().toLowerCase();
+  if (confirmEmail !== String(target.email ?? "").trim().toLowerCase()) {
+    return c.json({ error: "El email de confirmación no coincide" }, 400);
+  }
+  // Nunca eliminar al admin actual ni al último admin.
+  if (target.id === admin.id) return c.json({ error: "No puedes eliminarte a ti mismo" }, 400);
+  if (target.role === "admin") {
+    const { data: admins } = await adminClient().from("user_profiles").select("id").eq("role", "admin");
+    if ((admins?.length ?? 0) <= 1) return c.json({ error: "No se puede eliminar al último admin" }, 400);
+    return c.json({ error: "Eliminar un admin requiere un flujo excepcional explícito" }, 400);
+  }
+
+  const counts = await countUserData(targetId);
+  const before = { ...pickAccess(target), dataCounts: counts };
+  const nowIso = new Date().toISOString();
+
+  // Auditar ANTES de borrar (referencia FK válida); al borrar el Auth user,
+  // admin_audit_log.target_user_id pasará a NULL (JSON conserva la referencia).
+  await writeAdminAudit(admin.id, targetId, "user_deleted", before, { email: target.email, deletedAt: nowIso }, "eliminación aprobada con email confirmado");
+  await writeAudit(admin.id, "admin.user.deleted", "user_profiles", targetId, { email: target.email });
+
+  await deleteUserData(targetId);
+
+  const { error: delErr } = await adminClient().auth.admin.deleteUser(targetId);
+  if (delErr) throw new Error(delErr.message);
+
+  return c.json({ success: true, userId: targetId, email: target.email, deletedCounts: counts });
+});
+
+// ── Admin: historial de auditoría ─────────────────────────────────────────────
+app.get("/make-server-da3143e6/admin/audit", async (c) => {
+  const auth = await requireAdmin(c.req.header("Authorization"));
+  if (auth.error) return c.json(auth.error.body, auth.error.status);
+
+  const targetId = String(c.req.query("targetUserId") ?? "").trim();
+  let query = adminClient()
+    .from("admin_audit_log")
+    .select("*")
+    .order("created_at", { ascending: false })
+    .limit(100);
+  if (targetId) query = query.eq("target_user_id", targetId);
+  const { data, error } = await query;
+  if (error) throw new Error(error.message);
+  return c.json({ audit: data ?? [] });
 });
 
 Deno.serve(app.fetch);
