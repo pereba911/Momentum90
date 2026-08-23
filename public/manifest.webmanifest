@@ -1,0 +1,17 @@
+{
+  "name": "Momentum 90",
+  "short_name": "Momentum90",
+  "description": "Momentum 90 — Centro de control financiero personal",
+  "lang": "es",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "theme_color": "#0B0B0E",
+  "background_color": "#0B0B0E",
+  "icons": [
+    { "src": "/icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png" },
+    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}

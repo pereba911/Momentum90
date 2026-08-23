@@ -2344,7 +2344,7 @@ function MoneyTab({ s, set, hideAmounts, onToggleHide, onMutateIncomes, onMutate
       )}
 
       {confirmExcedente && (
-        <div className="fixed inset-0 z-[60] bg-black/80 flex items-center justify-center px-4">
+        <div className="fixed inset-0 z-[70] bg-black/80 flex items-center justify-center px-4">
           <div className="w-full max-w-sm bg-[#16161F] border border-amber-500/25 rounded-2xl p-5 shadow-2xl">
             <p className="text-white font-bold mb-2">Abono mayor al saldo pendiente</p>
             <p className="text-sm text-gray-400 mb-3">El abono de <b className="text-white">{fmt(confirmExcedente.amount, c)}</b> supera el saldo pendiente de <b className="text-white">{fmt(incomePending(confirmExcedente.income), c)}</b> por <b className="text-amber-400">{fmt(confirmExcedente.excedente, c)}</b>. Esto dejará un excedente sobre el monto total. ¿Quieres continuar?</p>
@@ -2362,7 +2362,7 @@ function MoneyTab({ s, set, hideAmounts, onToggleHide, onMutateIncomes, onMutate
       )}
 
       {confirmAnular && (
-        <div className="fixed inset-0 z-[60] bg-black/80 flex items-center justify-center px-4">
+        <div className="fixed inset-0 z-[70] bg-black/80 flex items-center justify-center px-4">
           <div className="w-full max-w-sm bg-[#16161F] border border-red-500/25 rounded-2xl p-5 shadow-2xl">
             <p className="text-white font-bold mb-2">Anular abono</p>
             <p className="text-sm text-gray-400 mb-3">Se marcará como <b className="text-red-400">anulado</b> (con auditoría) el abono de <b className="text-white">{fmt(confirmAnular.payment.amount, c)}</b> de <b className="text-white">{confirmAnular.income.description}</b>. No se elimina físicamente; el saldo pendiente volverá a aumentar. ¿Continuar?</p>
@@ -2431,7 +2431,7 @@ function MoneyTab({ s, set, hideAmounts, onToggleHide, onMutateIncomes, onMutate
       )}
 
       {confirmDebtExcedente && (
-        <div className="fixed inset-0 z-[60] bg-black/80 flex items-center justify-center px-4">
+        <div className="fixed inset-0 z-[70] bg-black/80 flex items-center justify-center px-4">
           <div className="w-full max-w-sm bg-[#16161F] border border-amber-500/25 rounded-2xl p-5 shadow-2xl">
             <p className="text-white font-bold mb-2">Abono mayor al saldo pendiente</p>
             <p className="text-sm text-gray-400 mb-3">El abono de <b className="text-white">{fmtExact(confirmDebtExcedente.amount, c)}</b> supera el saldo pendiente de <b className="text-white">{fmtExact(debtSaldo(confirmDebtExcedente.debt), c)}</b> por <b className="text-amber-400">{fmtExact(confirmDebtExcedente.excedente, c)}</b>. Esto liquidará la deuda y dejará un excedente. ¿Continuar?</p>
@@ -2449,7 +2449,7 @@ function MoneyTab({ s, set, hideAmounts, onToggleHide, onMutateIncomes, onMutate
       )}
 
       {confirmAnularAbono && (
-        <div className="fixed inset-0 z-[60] bg-black/80 flex items-center justify-center px-4">
+        <div className="fixed inset-0 z-[70] bg-black/80 flex items-center justify-center px-4">
           <div className="w-full max-w-sm bg-[#16161F] border border-red-500/25 rounded-2xl p-5 shadow-2xl">
             <p className="text-white font-bold mb-2">Anular abono</p>
             <p className="text-sm text-gray-400 mb-3">Se marcará como <b className="text-red-400">anulado</b> (con auditoría) el abono de <b className="text-white">{fmtExact(confirmAnularAbono.payment.amount, c)}</b> de <b className="text-white">{confirmAnularAbono.debt.name}</b>. El saldo pendiente volverá a aumentar. ¿Continuar?</p>
@@ -2463,7 +2463,7 @@ function MoneyTab({ s, set, hideAmounts, onToggleHide, onMutateIncomes, onMutate
 
       {/* ── Confirmación anular ajuste manual (FASE 3) ─────────────────────────── */}
       {confirmVoidAdj && (
-        <div className="fixed inset-0 z-[60] bg-black/80 flex items-center justify-center px-4">
+        <div className="fixed inset-0 z-[70] bg-black/80 flex items-center justify-center px-4">
           <div className="w-full max-w-sm bg-[#16161F] border border-amber-500/25 rounded-2xl p-5 shadow-2xl">
             <p className="text-white font-bold mb-2">Anular ajuste manual</p>
             <p className="text-sm text-gray-400 mb-3">Se marcará como <b className="text-amber-400">anulado</b> (con auditoría) el ajuste de <b className="text-white">{fmtExact(confirmVoidAdj.amount, c)}</b> ({confirmVoidAdj.reason}). No se elimina físicamente; deja de contar en el Total líquido calculado. ¿Continuar?</p>
@@ -3452,6 +3452,34 @@ function MissingConfigScreen() {
   );
 }
 
+// ── Detección de versión nueva de la app (SIN service worker) ────────────────
+// Compara el hash del bundle actual con el que sirve el servidor (fetch sin
+// cache). Si cambió, se muestra un aviso "Actualizar app" que hace reload sin
+// borrar sesión ni datos. Nunca deja cacheada una versión vieja.
+function useNewAppVersion(enabled: boolean): boolean {
+  const [newVersion, setNewVersion] = useState(false);
+  useEffect(() => {
+    if (!enabled) return;
+    let cancelled = false;
+    const current = (document.querySelector('script[type="module"][src]')?.getAttribute("src") || "").trim();
+    const check = () => {
+      if (cancelled) return;
+      fetch(`/?v=${Date.now()}`, { cache: "no-store", headers: { "Pragma": "no-cache" } })
+        .then(r => r.text())
+        .then(html => {
+          if (cancelled) return;
+          const m = html.match(/<script[^>]*type="module"[^>]*src="([^"]+)"/);
+          if (m && m[1] !== current) setNewVersion(true);
+        })
+        .catch(() => { /* sin conexión: silencioso */ });
+    };
+    check();
+    const id = setInterval(check, 60000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, [enabled]);
+  return newVersion;
+}
+
 export default function App() {
   // Guardia constante: si faltan las variables de Supabase, mostramos un aviso
   // en lugar de quedarnos en negro (nunca lanzamos en el import).
@@ -3464,6 +3492,22 @@ export default function App() {
   const [userEmail, setUserEmail] = useState("");
   const [tab, setTab] = useState<AppTab>("dashboard");
   const [showSettings, setShowSettings] = useState(false);
+  // Botón flotante global de registro rápido por voz (bottom-sheet).
+  const [showQuickModal, setShowQuickModal] = useState(false);
+  // Aviso "Actualizar app" (detección de versión sin service worker; global para todos los usuarios).
+  const [updateDismissed, setUpdateDismissed] = useState(false);
+  const newVersionAvailable = useNewAppVersion(!!session && !updateDismissed);
+  // Bloquea el scroll del body mientras el bottom-sheet de voz está abierto.
+  useEffect(() => {
+    document.body.style.overflow = showQuickModal ? "hidden" : "";
+    return () => { document.body.style.overflow = ""; };
+  }, [showQuickModal]);
+  // Auto-centra el tab activo en la navegación inferior (móvil) para que CRM,
+  // Logros, etc. sean siempre alcanzables con scroll horizontal.
+  useEffect(() => {
+    const el = document.getElementById(`tab-${tab}`);
+    if (el) el.scrollIntoView({ inline: "center", block: "nearest", behavior: "smooth" });
+  }, [tab]);
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // ── Sincronización A/B/D: refs espejo para leer valores actuales en timers/callbacks ──
@@ -3953,7 +3997,6 @@ export default function App() {
 
   const TABS: { id: AppTab; label: string; short: string; icon: ReactNode; badge?: number }[] = [
     { id: "dashboard", label: "Dashboard CEO", short: "CEO", icon: <LayoutDashboard size={16} /> },
-    { id: "quick", label: "Registro rápido (voz)", short: "Voz", icon: <Mic size={16} /> },
     { id: "money", label: "Motor de Dinero", short: "Dinero", icon: <Zap size={16} /> },
     { id: "capital", label: "Capital & Metas", short: "Capital", icon: <Target size={16} /> },
     { id: "activos", label: "Activos", short: "Activos", icon: <Wallet size={16} /> },
@@ -3966,6 +4009,14 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-[#0B0B0E] text-white" style={{ fontFamily: "'Inter', sans-serif" }}>
+      {/* Aviso de versión nueva: reload sin borrar datos (global, sin service worker) */}
+      {newVersionAvailable && session && !updateDismissed && (
+        <div className="fixed top-3 left-1/2 -translate-x-1/2 z-[55] bg-[#16161F] border border-[#9D4EDD]/40 rounded-xl px-4 py-2 flex items-center gap-3 shadow-lg max-w-[92vw]">
+          <p className="text-xs text-gray-300">Hay una versión nueva de la app.</p>
+          <button onClick={() => location.reload()} className="text-xs px-3 py-1.5 bg-[#9D4EDD] text-white rounded-lg font-medium min-h-11">Actualizar app</button>
+          <button onClick={() => setUpdateDismissed(true)} className="text-gray-500 hover:text-white" aria-label="Cerrar aviso de actualización"><X size={14} /></button>
+        </div>
+      )}
       {showSettings && (
         <div className="fixed inset-0 z-[60] bg-black/60 flex justify-end overflow-hidden">
           <div
@@ -4035,7 +4086,6 @@ export default function App() {
             </div>
           )}
           {tab === "dashboard" && <DashboardTab s={data} set={setData} hideAmounts={hideAmounts} onToggleHide={toggleHideAmounts} />}
-          {tab === "quick" && <QuickRecordPage data={data} accessToken={session?.access_token} onMutateIncomes={mutateIncomes} onMutateExpenses={mutateExpenses} onMutateDebts={mutateDebts} onMutateDebtPayment={mutateDebtPayment} onGoTo={t => setTab(t as AppTab)} />}
           {tab === "money" && <MoneyTab s={data} set={setData} hideAmounts={hideAmounts} onToggleHide={toggleHideAmounts} onMutateIncomes={mutateIncomes} onMutateDebts={mutateDebts} />}
           {tab === "capital" && <CapitalTab s={data} set={setData} hideAmounts={hideAmounts} onToggleHide={toggleHideAmounts} />}
           {tab === "activos" && <AssetsTab s={data} set={setData} hideAmounts={hideAmounts} onToggleHide={toggleHideAmounts} />}
@@ -4048,10 +4098,10 @@ export default function App() {
       </div>
 
       {/* Mobile bottom nav */}
-      <nav className="lg:hidden fixed bottom-0 left-0 right-0 z-50 bg-[#0D0D12]/95 backdrop-blur-xl border-t border-white/5">
-        <div className="flex items-center overflow-x-auto px-1 py-1.5 gap-1 scrollbar-hide">
+      <nav className="lg:hidden fixed bottom-0 left-0 right-0 z-50 bg-[#0D0D12]/95 backdrop-blur-xl border-t border-white/5 pb-[env(safe-area-inset-bottom)]">
+        <div className="flex items-center overflow-x-auto px-1 py-1.5 gap-1 scrollbar-hide scroll-smooth">
           {TABS.map(t => (
-            <button key={t.id} onClick={() => setTab(t.id)} className={`flex flex-col items-center gap-0.5 py-1.5 px-3 rounded-xl transition-all relative shrink-0 ${tab === t.id ? "text-[#c084fc] bg-[#9D4EDD]/10" : "text-gray-600 hover:text-gray-400"}`}>
+            <button key={t.id} id={`tab-${t.id}`} onClick={() => setTab(t.id)} className={`flex flex-col items-center gap-0.5 py-1.5 px-3 min-w-[52px] rounded-xl transition-all relative shrink-0 ${tab === t.id ? "text-[#c084fc] bg-[#9D4EDD]/10" : "text-gray-600 hover:text-gray-400"}`}>
               {t.icon}
               <span className="text-[9px] font-medium">{t.short}</span>
               {t.id === "tasks" && keyDone < 3 && <div className="absolute -top-0.5 -right-0.5 w-3 h-3 bg-amber-400 rounded-full text-[7px] text-black font-black flex items-center justify-center">{keyDone}</div>}
@@ -4061,6 +4111,45 @@ export default function App() {
           ))}
         </div>
       </nav>
+
+      {/* Botón flotante global de registro rápido por voz (visible en cualquier pantalla) */}
+      {session && (
+        <>
+          <button
+            onClick={() => setShowQuickModal(true)}
+            aria-label="Registro rápido por voz"
+            className="fixed right-4 z-[65] flex h-14 w-14 items-center justify-center rounded-full bg-[#9D4EDD] text-white shadow-lg shadow-[#9D4EDD]/40 active:scale-95 transition-transform bottom-[calc(env(safe-area-inset-bottom)+5.5rem)] lg:right-6 lg:bottom-6"
+          >
+            <Mic size={22} />
+          </button>
+          {showQuickModal && (
+            <div className="fixed inset-0 z-[80] bg-black/70 flex items-end justify-center" onClick={() => setShowQuickModal(false)}>
+              <div
+                className="w-full max-w-lg bg-[#16161F] rounded-t-2xl border-t border-white/10 flex flex-col overflow-hidden shadow-2xl"
+                onClick={e => e.stopPropagation()}
+                style={{ height: "min(90dvh, 720px)" }}
+              >
+                <div className="flex items-center justify-between px-5 py-4 border-b border-white/5 shrink-0">
+                  <p className="text-white font-bold">Registro rápido por voz</p>
+                  <button onClick={() => setShowQuickModal(false)} className="w-9 h-9 flex items-center justify-center text-gray-500 hover:text-white rounded-xl" aria-label="Cerrar registro rápido"><X size={18} /></button>
+                </div>
+                <div className="flex-1 overflow-y-auto overscroll-contain px-4 py-4 pb-[calc(1.5rem+env(safe-area-inset-bottom))]">
+                  <QuickRecordPage
+                    data={data}
+                    accessToken={session?.access_token}
+                    embedded
+                    onMutateIncomes={mutateIncomes}
+                    onMutateExpenses={mutateExpenses}
+                    onMutateDebts={mutateDebts}
+                    onMutateDebtPayment={mutateDebtPayment}
+                    onGoTo={t => { setShowQuickModal(false); setTab(t as AppTab); }}
+                  />
+                </div>
+              </div>
+            </div>
+          )}
+        </>
+      )}
     </div>
   );
 }

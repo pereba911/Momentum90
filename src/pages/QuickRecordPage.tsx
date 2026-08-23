@@ -14,9 +14,10 @@ interface QuickData {
   businesses: { id: string; name: string }[];
 }
 
-export default function QuickRecordPage({ data, accessToken, onMutateIncomes, onMutateExpenses, onMutateDebts, onMutateDebtPayment, onGoTo }: {
+export default function QuickRecordPage({ data, accessToken, embedded, onMutateIncomes, onMutateExpenses, onMutateDebts, onMutateDebtPayment, onGoTo }: {
   data: QuickData;
   accessToken?: string;
+  embedded?: boolean; // true cuando se muestra dentro del bottom-sheet global
   onMutateIncomes: (u: (prev: any[]) => any[]) => Promise<boolean>;
   onMutateExpenses: (u: (prev: any[]) => any[]) => Promise<boolean>;
   onMutateDebts: (u: (prev: any[]) => any[]) => Promise<boolean>;
@@ -113,10 +114,12 @@ export default function QuickRecordPage({ data, accessToken, onMutateIncomes, on
 
   return (
     <div className="space-y-4">
-      <div>
-        <h2 className="text-lg font-bold text-white">Registro rápido por voz</h2>
-        <p className="text-sm text-gray-500">Graba una frase; la IA extrae ingresos, gastos o abonos y tú apruebas antes de guardar. <span className="text-gray-400">Nada se guarda sin tu confirmación.</span></p>
-      </div>
+      {!embedded && (
+        <div>
+          <h2 className="text-lg font-bold text-white">Registro rápido por voz</h2>
+          <p className="text-sm text-gray-500">Graba una frase; la IA extrae ingresos, gastos o abonos y tú apruebas antes de guardar. <span className="text-gray-400">Nada se guarda sin tu confirmación.</span></p>
+        </div>
+      )}
       <VoiceRecorder userContext={userContext} accessToken={accessToken} onSave={handleSave} onDone={() => onGoTo("dashboard")} />
     </div>
   );

@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import {
   Mic, Square, Loader2, AlertTriangle, CheckCircle2, RotateCcw, X, Wand2, FileText, Sparkles,
 } from "lucide-react";
-import { isSpeechSupported, startSpeechRecognition, type ActiveRecognition } from "../utils/speechToText";
+import { isSpeechSupported, startSpeechRecognition, SPEECH_ERROR_MESSAGES, type ActiveRecognition, type SpeechStatus } from "../utils/speechToText";
 import { extractWithAI, type AIExtraction, type AIOperation, type UserContext } from "../utils/extractWithAI";
 import { validateExtraction, aiOpCashEffect, type ValidationResult } from "../utils/validateExtraction";
 
@@ -26,7 +26,8 @@ export default function VoiceRecorder({ userContext, accessToken, onSave, onCanc
   onCancel?: () => void;
   onDone?: () => void;
 }) {
-  const [isRecording, setIsRecording] = useState(false);
+  const [status, setStatus] = useState<SpeechStatus>("idle");
+  const isRecording = status === "listening" || status === "requesting_permission";
   const [seconds, setSeconds] = useState(0);
   const [interim, setInterim] = useState("");
   const [transcribed, setTranscribed] = useState("");
@@ -42,19 +43,24 @@ export default function VoiceRecorder({ userContext, accessToken, onSave, onCanc
   const recRef = useRef<ActiveRecognition | null>(null);
   const tickRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  useEffect(() => () => { if (tickRef.current) clearInterval(tickRef.current); try { recRef.current?.stop(); } catch { /* noop */ } }, []);
+  const clearTicker = () => { if (tickRef.current) { clearInterval(tickRef.current); tickRef.current = null; } };
+  const stopActive = () => { try { recRef.current?.abort(); } catch { /* noop */ } recRef.current = null; };
+
+  // Limpieza segura al desmontar: nunca dejar el micrófono activo ni la UI congelada.
+  useEffect(() => () => { clearTicker(); stopActive(); }, []);
 
   const reset = () => {
-    if (tickRef.current) { clearInterval(tickRef.current); tickRef.current = null; }
-    try { recRef.current?.stop(); } catch { /* noop */ }
-    recRef.current = null;
-    setIsRecording(false); setSeconds(0); setInterim(""); setTranscribed(""); setManualText("");
+    clearTicker(); stopActive();
+    setStatus("idle"); setSeconds(0); setInterim(""); setTranscribed(""); setManualText("");
     setExtraction(null); setValidation(null); setError(null); setInfo(null); setSaved(false);
   };
 
   const startRecording = () => {
+    // Guard: nunca dos starts en la misma sesión ni mientras se procesa/guarda.
+    if (isRecording || status === "processing" || isLoading || saving) return;
     if (!isSpeechSupported()) {
-      setError("Tu navegador no soporta reconocimiento de voz. Usa Chrome o Edge para grabar.");
+      setStatus("error");
+      setError(SPEECH_ERROR_MESSAGES["not-supported"]);
       return;
     }
     setError(null); setInfo(null); setSaved(false);
@@ -67,40 +73,36 @@ export default function VoiceRecorder({ userContext, accessToken, onSave, onCanc
     }, 400);
 
     const active = startSpeechRecognition({
+      onStatusChange: (st) => { setStatus(st); if (st === "idle" || st === "error") clearTicker(); },
       onResult: (it, fin) => { setInterim(it); setTranscribed(fin); },
-      onError: (_code, msg) => {
-        setIsRecording(false);
-        if (tickRef.current) { clearInterval(tickRef.current); tickRef.current = null; }
-        setError(msg);
-      },
-      onEnd: () => {
-        setIsRecording(false);
-        if (tickRef.current) { clearInterval(tickRef.current); tickRef.current = null; }
-      },
-    }, MAX_SECONDS);
+      onError: (_code, msg) => { clearTicker(); setStatus("idle"); setError(msg); },
+      onEnd: () => { clearTicker(); setStatus("idle"); },
+    }, { maxSeconds: MAX_SECONDS });
 
     recRef.current = active;
-    setIsRecording(true);
   };
 
   const stopRecording = () => {
+    // Detención suave: conserva la transcripción; onend vuelve a idle.
     try { recRef.current?.stop(); } catch { /* noop */ }
+    clearTicker();
   };
 
   const runExtraction = async (text?: string) => {
     const t = (text ?? manualText ?? transcribed).trim();
-    if (!t) { setError("No hay texto transcrito. Graba o usa el ejemplo."); return; }
-    setIsLoading(true); setError(null); setInfo(null);
+    if (!t) { setError("No hay texto transcrito. Graba o escribe el texto manualmente."); return; }
+    setIsLoading(true); setStatus("processing"); setError(null); setInfo(null);
     try {
       const ex = await extractWithAI(t, userContext, accessToken || "");
       setExtraction(ex);
       setValidation(validateExtraction(ex, userContext));
       setInfo("Extracción completada. Revisa la bandeja antes de guardar.");
     } catch (e) {
+      // Conservar el texto: el usuario puede reintentar sin volver a escribir.
       setExtraction(null); setValidation(null);
       setError(e instanceof Error ? e.message : "Error al extraer con IA.");
     } finally {
-      setIsLoading(false);
+      setIsLoading(false); setStatus("idle");
     }
   };
 
@@ -160,7 +162,7 @@ export default function VoiceRecorder({ userContext, accessToken, onSave, onCanc
           <div className="flex flex-col items-center gap-2 py-4">
             <button
               onClick={isRecording ? stopRecording : startRecording}
-              disabled={isLoading || saving}
+              disabled={status === "processing" || isLoading || saving}
               className={`relative w-24 h-24 rounded-full flex items-center justify-center transition-all disabled:opacity-60 ${
                 isRecording ? "bg-red-500/20 border-2 border-red-500 animate-pulse" : "bg-[#9D4EDD]/15 border-2 border-[#9D4EDD]/40 hover:bg-[#9D4EDD]/25"
               }`}
@@ -168,13 +170,21 @@ export default function VoiceRecorder({ userContext, accessToken, onSave, onCanc
             >
               {isRecording ? <Square size={28} className="text-red-400" /> : <Mic size={30} className="text-[#c084fc]" />}
             </button>
-            <p className="text-xs text-gray-500">
-              {isRecording ? `Grabando… ${seconds}/${MAX_SECONDS}s` : `Toca el micrófono para grabar (máx. ${MAX_SECONDS}s)`}
+            <p className="text-xs text-gray-500 min-h-[16px]">
+              {status === "requesting_permission" ? "Solicitando permiso del micrófono…"
+                : status === "listening" ? `Grabando… ${seconds}/${MAX_SECONDS}s`
+                : status === "processing" ? "Procesando…"
+                : `Toca el micrófono para grabar (máx. ${MAX_SECONDS}s)`}
             </p>
+            {isRecording && (
+              <button onClick={stopRecording} className="flex items-center gap-1.5 px-4 py-2 bg-red-500/15 border border-red-500/30 text-red-400 rounded-xl text-xs font-medium hover:bg-red-500/25 min-h-11" aria-label="Detener grabación">
+                <Square size={13} /> Detener grabación
+              </button>
+            )}
             {isSpeechSupported() ? (
               <p className="text-[11px] text-gray-600">Habla en español. Verás el texto mientras grabas.</p>
             ) : (
-              <p className="text-[11px] text-amber-400/80">Este navegador no soporta voz; puedes usar el ejemplo para probar el flujo.</p>
+              <p className="text-[11px] text-amber-400/80">Este navegador no soporta reconocimiento de voz; escribe el texto manualmente.</p>
             )}
           </div>
 

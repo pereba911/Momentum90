@@ -1,11 +1,21 @@
-// Wrapper de la Web Speech API (webkitSpeechRecognition) para dictado por voz.
-// Primera opción: gratis y nativa en Chrome/Edge. Requiere permiso de micrófono.
-// En navegadores sin soporte devuelve un error claro (no rompe la app).
+// Wrapper ROBUSTO de la Web Speech API (webkitSpeechRecognition) para dictado por voz.
+// Máquina de estados: idle → requesting_permission → listening → processing → idle/error.
+// NUNCA llama start() dos veces en la misma sesión y SIEMPRE vuelve a idle en onend.
+// El límite de tiempo es SOLO de seguridad: detiene pero conserva la transcripción.
+
+export type SpeechStatus = "idle" | "requesting_permission" | "listening" | "processing" | "error";
 
 export interface SpeechHandlers {
+  onStatusChange?: (status: SpeechStatus) => void;
   onResult: (interim: string, final: string) => void;
   onError: (code: string, message: string) => void;
   onEnd: () => void;
+}
+
+export interface SpeechOptions {
+  lang?: string;         // default "es-MX"
+  maxSeconds?: number;   // límite de SEGURIDAD (default 10); no descarta transcripción
+  continuous?: boolean;  // default true
 }
 
 type SpeechRecognitionCtor = new () => any;
@@ -22,46 +32,59 @@ export function isSpeechSupported(): boolean {
   return getSpeechRecognitionCtor() !== null;
 }
 
-const DEFAULT_ERRORS: Record<string, string> = {
+export const SPEECH_ERROR_MESSAGES: Record<string, string> = {
   "no-speech": "No se detectó voz. Inténtalo de nuevo.",
   "audio-capture": "No se encontró micrófono.",
-  "not-allowed": "Permiso de micrófono denegado. Habilítalo en tu navegador.",
+  "not-allowed": "Permiso de micrófono denegado. Habilítalo en tu navegador y vuelve a intentar.",
   "service-not-allowed": "El servicio de voz no está disponible en este navegador.",
-  network: "Error de red del servicio de voz.",
+  network: "Error de red del servicio de voz. Revisa tu conexión.",
   aborted: "Grabación cancelada.",
+  "not-supported": "Tu navegador no soporta reconocimiento de voz. Escribe el texto manualmente.",
+  "start-failed": "No se pudo iniciar el micrófono. Verifica el permiso.",
 };
 
 export interface ActiveRecognition {
   recognition: any;
-  stop: () => void;
+  stop: () => void;    // detención suave: conserva la transcripción ya capturada
+  abort: () => void;   // detención inmediata: para desmontaje/cierre
 }
 
-// Inicia el reconocimiento en es-MX con resultados intermedios.
-// maxSeconds: tope de grabación (default 10 s); al llegar, detiene solo.
-export function startSpeechRecognition(handlers: SpeechHandlers, maxSeconds = 10): ActiveRecognition {
+// Inicia el reconocimiento en es-MX. Garantiza un único start por sesión y que
+// onend siempre regrese el estado a "idle" (nunca deja la UI congelada).
+export function startSpeechRecognition(handlers: SpeechHandlers, opts: SpeechOptions = {}): ActiveRecognition {
+  const { lang = "es-MX", maxSeconds = 10, continuous = true } = opts;
   const Ctor = getSpeechRecognitionCtor();
   if (!Ctor) {
-    handlers.onError("not-supported", "Tu navegador no soporta reconocimiento de voz. Usa Chrome o Edge.");
-    return { recognition: null, stop: () => {} };
+    handlers.onStatusChange?.("error");
+    handlers.onError("not-supported", SPEECH_ERROR_MESSAGES["not-supported"]);
+    return { recognition: null, stop: () => {}, abort: () => {} };
   }
 
+  let started = false;
+  let ended = false;
+  let finalText = "";
+  let timer: ReturnType<typeof setTimeout> | null = null;
   const rec = new Ctor();
-  rec.lang = "es-MX";
-  rec.continuous = true;
+
+  const setStatus = (s: SpeechStatus) => handlers.onStatusChange?.(s);
+  const clearTimer = () => { if (timer) { clearTimeout(timer); timer = null; } };
+  const safeStop = () => { try { rec.stop(); } catch { /* ya detenido */ } };
+  const safeAbort = () => { try { rec.abort(); } catch { /* ya detenido */ } };
+
+  // Detención suave: dispara onend → idle, sin descartar la transcripción.
+  const finish = () => {
+    if (ended) return;
+    ended = true;
+    clearTimer();
+    safeStop();
+  };
+
+  rec.lang = lang;
+  rec.continuous = continuous;
   rec.interimResults = true;
   rec.maxAlternatives = 1;
 
-  let finalText = "";
-  let finished = false;
-  let timer: ReturnType<typeof setTimeout> | null = null;
-
-  const clearTimer = () => { if (timer) { clearTimeout(timer); timer = null; } };
-  const finish = () => {
-    if (finished) return;
-    finished = true;
-    clearTimer();
-    try { rec.stop(); } catch { /* ya detenido */ }
-  };
+  rec.onstart = () => { started = true; setStatus("listening"); };
 
   rec.onresult = (event: any) => {
     let interim = "";
@@ -76,27 +99,39 @@ export function startSpeechRecognition(handlers: SpeechHandlers, maxSeconds = 10
 
   rec.onerror = (event: any) => {
     const code = event?.error || "unknown";
-    handlers.onError(code, DEFAULT_ERRORS[code] || `Error de reconocimiento: ${code}`);
+    if (code !== "aborted") setStatus("error"); // aborted → onend lo lleva a idle
+    handlers.onError(code, SPEECH_ERROR_MESSAGES[code] || `Error de reconocimiento: ${code}`);
   };
 
   rec.onend = () => {
     clearTimer();
+    ended = true;
+    setStatus("idle"); // SIEMPRE volver a idle
     handlers.onEnd();
   };
 
   try {
+    setStatus("requesting_permission");
     rec.start();
   } catch {
-    handlers.onError("start-failed", "No se pudo iniciar el micrófono. Verifica el permiso.");
-    return { recognition: rec, stop: () => {} };
+    setStatus("error");
+    handlers.onError("start-failed", SPEECH_ERROR_MESSAGES["start-failed"]);
+    return { recognition: rec, stop: () => {}, abort: () => safeAbort() };
   }
 
-  timer = setTimeout(() => finish(), maxSeconds * 1000);
+  // Límite de SEGURIDAD: solo detiene; la transcripción ya capturada se conserva.
+  if (maxSeconds > 0) {
+    timer = setTimeout(() => { if (!ended) safeStop(); }, maxSeconds * 1000);
+  }
 
-  return { recognition: rec, stop: () => finish() };
+  return {
+    recognition: rec,
+    stop: () => finish(),
+    abort: () => { clearTimer(); ended = true; safeAbort(); },
+  };
 }
 
-// Detiene el reconocimiento activo (si existe).
+// Detiene el reconocimiento activo de forma segura (no lanza).
 export function stopSpeechRecognition(recognition: any): void {
   if (!recognition) return;
   try { recognition.stop(); } catch { /* ya detenido */ }
