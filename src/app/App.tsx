@@ -6,10 +6,11 @@ import {
   Building2, Pencil, ChevronLeft, ChevronRight, Star,
   LogOut, Lock, Mail, Eye, EyeOff, Award, Flame, RefreshCw,
   Wallet, ShieldCheck, Users, Plug, AlertCircle, Info,
-  FileDown, ChevronUp, History
+  FileDown, ChevronUp, History, Mic
 } from "lucide-react";
 import { api, supabase, SUPABASE_CONFIGURED, DEFAULT_SETTINGS, type AppEntityName, type Asset, type AssetType, type IntegrationConfig } from "../lib/supabase";
 import { buildExpenseReportPdf } from "./reportPdf";
+import QuickRecordPage from "../pages/QuickRecordPage";
 import {
   AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer,
   RadarChart, Radar, PolarGrid, PolarAngleAxis,
@@ -24,7 +25,7 @@ type GoalStatus = "active" | "in-progress" | "completed";
 type GoalKind = "money" | "habit" | "task";
 type GoalCategory = "salud_y_cuerpo" | "carrera_y_trabajo" | "dinero" | "relaciones" | "deseos_personales";
 type TaskRecurringType = "none" | "daily" | "weekly" | "monthly" | "annual";
-type AppTab = "dashboard" | "money" | "capital" | "plan" | "tasks" | "crm" | "logros" | "activos" | "admin";
+type AppTab = "dashboard" | "money" | "capital" | "plan" | "tasks" | "crm" | "logros" | "activos" | "admin" | "quick";
 type HabitCategory = "salud" | "negocio" | "enfoque";
 type ObjType = "monetary" | "task" | "habit" | "metric" | "relationship" | "other";
 type BusinessStatus = "idea" | "revision" | "por-publicar" | "marketing" | "ventas" | "negociacion" | "requerimiento" | "proceso";
@@ -43,8 +44,9 @@ interface Income {
   expectedDate?: string;         // fecha estimada de cobro
   notes?: string;                // notas (FASE 4)
   goalId?: string; goalAllocation?: string; // abono a meta monetaria (campo ya usado en el formulario)
+  recordSource?: string;         // auditoría de origen (p. ej. "voice")
 }
-interface Expense { id: string; date: string; category: string; businessCategory: string; description: string; amount: number; recurring?: boolean; }
+interface Expense { id: string; date: string; category: string; businessCategory: string; description: string; amount: number; recurring?: boolean; recordSource?: string; }
 interface DebtPayment { id: string; date: string; amount: number; note?: string; voided?: boolean; voidedAt?: string; }
 interface Debt {
   id: string; name: string; balance: number; minPayment: number; targetPayment: number; originalBalance: number; targetDate: string;
@@ -56,6 +58,7 @@ interface Debt {
   payments?: DebtPayment[]; // historial de abonos (nunca se borra: se anula con voided)
   amountPaid?: number;  // derivado (abonado acumulado)
   status?: "Pendiente" | "Liquidada"; // derivado
+  recordSource?: string; // auditoría de origen (p. ej. "voice")
 }
 interface StressEntry { date: string; level: number; }
 interface GoalProgressEntry { id: string; date: string; amount: number; note?: string; voided?: boolean; voidedAt?: string; }
@@ -3437,6 +3440,56 @@ export default function App() {
     }
   }
 
+  // Mutación verificada de gastos (Registro por voz): escribe en user_entities y
+  // SOLO si Supabase responde OK se refleja en la interfaz.
+  async function mutateExpenses(updater: (prev: Expense[]) => Expense[]): Promise<boolean> {
+    const s = sessionRef.current;
+    if (!s?.access_token) { setSaveError("No hay una sesión válida."); return false; }
+    if (!loadedRef.current) { setSaveError("Tus datos aún no se han cargado. Inténtalo en un momento."); return false; }
+    const prev = Array.isArray(dataRef.current.expenses) ? dataRef.current.expenses : [];
+    const next = updater(prev);
+    try {
+      await api.saveEntity(s.access_token, "expenses", next);
+      setData({ ...dataRef.current, expenses: next });
+      setSaveError(null);
+      return true;
+    } catch (e) {
+      console.error("[SAVE_EXPENSE_ERROR]", e);
+      setSaveError("No se pudo guardar el gasto. Revisa tu conexión e inténtalo de nuevo.");
+      return false;
+    }
+  }
+
+  // Abono verificado a una deuda existente (Registro por voz): registra en el
+  // historial (auditable) y recalcula saldo/estado sin borrar nada.
+  async function mutateDebtPayment(debtId: string, amount: number, date: string, note?: string): Promise<boolean> {
+    const s = sessionRef.current;
+    if (!s?.access_token) { setSaveError("No hay una sesión válida."); return false; }
+    if (!loadedRef.current) { setSaveError("Tus datos aún no se han cargado. Inténtalo en un momento."); return false; }
+    const prev = Array.isArray(dataRef.current.debts) ? dataRef.current.debts : [];
+    const next = prev.map(d => {
+      if (d.id !== debtId) return d;
+      const prevPaid = debtPaid(d);
+      const base = d.payments && d.payments.length > 0
+        ? d.payments
+        : (prevPaid > 0 ? [{ id: uid(), date: today(), amount: prevPaid, note: "Acumulado previo (migración)" } as DebtPayment] : []);
+      const newHist = [...base, { id: uid(), date, amount, note: note || "Abono por voz" }];
+      const newCur = newHist.filter(p => !p.voided).reduce((a, p) => a + (Number(p.amount) || 0), 0);
+      return recomputeDebt({ ...d, payments: newHist, amountPaid: newCur });
+    });
+    if (!validateDebts(next)) { setSaveError("Datos de deuda inválidos. No se guardó nada."); return false; }
+    try {
+      await api.saveEntity(s.access_token, "debts", next);
+      setData({ ...dataRef.current, debts: next });
+      setSaveError(null);
+      return true;
+    } catch (e) {
+      console.error("[SAVE_DEBT_PAYMENT_ERROR]", e);
+      setSaveError("No se pudo guardar el abono. Revisa tu conexión e inténtalo de nuevo.");
+      return false;
+    }
+  }
+
   // Detecta cambios reales (diff contra el último estado conocido en la nube) y agenda el guardado.
   useEffect(() => {
     if (!loadedRef.current) return;               // A1/A3: nada de guardado antes de LOAD
@@ -3568,6 +3621,7 @@ export default function App() {
 
   const TABS: { id: AppTab; label: string; short: string; icon: ReactNode; badge?: number }[] = [
     { id: "dashboard", label: "Dashboard CEO", short: "CEO", icon: <LayoutDashboard size={16} /> },
+    { id: "quick", label: "Registro rápido (voz)", short: "Voz", icon: <Mic size={16} /> },
     { id: "money", label: "Motor de Dinero", short: "Dinero", icon: <Zap size={16} /> },
     { id: "capital", label: "Capital & Metas", short: "Capital", icon: <Target size={16} /> },
     { id: "activos", label: "Activos", short: "Activos", icon: <Wallet size={16} /> },
@@ -3649,6 +3703,7 @@ export default function App() {
             </div>
           )}
           {tab === "dashboard" && <DashboardTab s={data} set={setData} hideAmounts={hideAmounts} onToggleHide={toggleHideAmounts} />}
+          {tab === "quick" && <QuickRecordPage data={data} accessToken={session?.access_token} onMutateIncomes={mutateIncomes} onMutateExpenses={mutateExpenses} onMutateDebts={mutateDebts} onMutateDebtPayment={mutateDebtPayment} onGoTo={t => setTab(t as AppTab)} />}
           {tab === "money" && <MoneyTab s={data} set={setData} hideAmounts={hideAmounts} onToggleHide={toggleHideAmounts} onMutateIncomes={mutateIncomes} onMutateDebts={mutateDebts} />}
           {tab === "capital" && <CapitalTab s={data} set={setData} hideAmounts={hideAmounts} onToggleHide={toggleHideAmounts} />}
           {tab === "activos" && <AssetsTab s={data} set={setData} hideAmounts={hideAmounts} onToggleHide={toggleHideAmounts} />}
