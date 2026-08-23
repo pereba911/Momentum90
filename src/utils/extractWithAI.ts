@@ -12,27 +12,27 @@ export interface UserContext {
   today: string;                                   // YYYY-MM-DD (local)
 }
 
-export type AIOperationType = "income" | "expense" | "debt";
+export type AIOperationType = "expense" | "income" | "debt_payment" | "debt_creation" | "commitment" | "asset" | "transfer" | "income_payment" | "unknown";
 
 export interface AIOperation {
   type: AIOperationType;
-  amount: number;
-  date: string;               // YYYY-MM-DD
-  description: string;
-  category?: string;
-  matchedDebtName?: string;   // nombre de deuda conocida (se resuelve a id al guardar)
-  matchedContactName?: string;
-  confidence: number;         // 0..1
-  notes?: string;
+  amount: number | null;
+  currency: string | null;
+  date: string | null;            // YYYY-MM-DD o null
+  category: string | null;
+  merchant_or_contact: string | null;
+  notes: string | null;
+  confidence: number;             // 0..1
+  ambiguities: string[];
 }
 
 export interface AIExtraction {
   operations: AIOperation[];
   explanation: string;
-  suggested_category?: string;
-  matched_debt?: string;
-  matched_contact?: string;
-  source: "voice";
+  suggested_category: string | null;
+  matched_debt: string | null;
+  matched_contact: string | null;
+  source?: "voice";
 }
 
 // URL de la Edge Function (mismo patrón que el resto de la app).
@@ -69,14 +69,18 @@ export async function extractWithAI(transcribedText: string, userContext: UserCo
   }
 
   const data = (await res.json()) as any;
-  const extraction = data?.extraction;
+  // La Edge Function responde { success: true, data: <extracción> }.
+  if (data?.success === false) {
+    throw new Error(typeof data.error === "string" ? data.error : "La IA no pudo extraer información.");
+  }
+  const extraction = data?.data;
   if (!extraction || !Array.isArray(extraction.operations)) {
     throw new Error("La IA no devolvió una extracción válida.");
   }
   return extraction as AIExtraction;
 }
 
-// Parsea el JSON devuelto por la IA tolerando fences de markdown.
+// Parsea el JSON devuelto por la IA tolerando fences de markdown (fallback local).
 export function parseExtraction(content: string): AIExtraction {
   let raw = (content || "").trim();
   raw = raw.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/, "");
@@ -85,9 +89,9 @@ export function parseExtraction(content: string): AIExtraction {
   return {
     operations: ops,
     explanation: typeof parsed.explanation === "string" ? parsed.explanation : "",
-    suggested_category: typeof parsed.suggested_category === "string" ? parsed.suggested_category : undefined,
-    matched_debt: typeof parsed.matched_debt === "string" ? parsed.matched_debt : undefined,
-    matched_contact: typeof parsed.matched_contact === "string" ? parsed.matched_contact : undefined,
+    suggested_category: parsed?.suggested_category ?? null,
+    matched_debt: parsed?.matched_debt ?? null,
+    matched_contact: parsed?.matched_contact ?? null,
     source: "voice",
   };
 }

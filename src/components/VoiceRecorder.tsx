@@ -9,8 +9,14 @@ import { validateExtraction, type ValidationResult } from "../utils/validateExtr
 const MAX_SECONDS = 10;
 const TYPE_META: Record<string, { label: string; cls: string }> = {
   income: { label: "💵 Ingreso", cls: "bg-emerald-500/10 text-emerald-400 border-emerald-500/25" },
+  income_payment: { label: "💵 Cobro de ingreso", cls: "bg-emerald-500/10 text-emerald-400 border-emerald-500/25" },
   expense: { label: "💸 Gasto", cls: "bg-red-500/10 text-red-400 border-red-500/25" },
-  debt: { label: "💳 Deuda / Abono", cls: "bg-amber-500/10 text-amber-400 border-amber-500/25" },
+  debt_payment: { label: "💳 Abono a deuda", cls: "bg-amber-500/10 text-amber-400 border-amber-500/25" },
+  debt_creation: { label: "💳 Nueva deuda", cls: "bg-amber-500/10 text-amber-400 border-amber-500/25" },
+  commitment: { label: "📌 Compromiso", cls: "bg-sky-500/10 text-sky-400 border-sky-500/25" },
+  asset: { label: "🏦 Activo", cls: "bg-violet-500/10 text-violet-400 border-violet-500/25" },
+  transfer: { label: "🔁 Transferencia", cls: "bg-cyan-500/10 text-cyan-400 border-cyan-500/25" },
+  unknown: { label: "❓ Sin clasificar", cls: "bg-white/5 text-gray-400 border-white/10" },
 };
 
 export default function VoiceRecorder({ userContext, accessToken, onSave, onCancel, onDone }: {
@@ -103,10 +109,13 @@ export default function VoiceRecorder({ userContext, accessToken, onSave, onCanc
     setError(null); setInfo(null); setSaved(false);
     const sample: AIExtraction = {
       operations: [
-        { type: "income", amount: 2500, date: userContext.today, description: "Pago de consultoría (ejemplo)", category: "Consultoría", confidence: 0.9, notes: "Registro por voz de ejemplo" },
-        { type: "expense", amount: 350, date: userContext.today, description: "Gasolina (ejemplo)", category: "Transporte", confidence: 0.95, notes: "Registro por voz de ejemplo" },
+        { type: "income", amount: 2500, currency: userContext.primaryCurrency, date: userContext.today, category: "Consultoría", merchant_or_contact: null, notes: "Pago de consultoría (ejemplo)", confidence: 0.9, ambiguities: [] },
+        { type: "expense", amount: 350, currency: userContext.primaryCurrency, date: userContext.today, category: "Transporte", merchant_or_contact: "Gasolinera", notes: "Gasolina (ejemplo)", confidence: 0.95, ambiguities: [] },
       ],
       explanation: `Ejemplo de prueba: un ingreso de 2500 ${userContext.primaryCurrency} por consultoría y un gasto de 350 ${userContext.primaryCurrency} de gasolina.`,
+      suggested_category: null,
+      matched_debt: null,
+      matched_contact: null,
       source: "voice",
     };
     setTranscribed("Recibí 2500 por consultoría y pagué 350 de gasolina (ejemplo)");
@@ -244,22 +253,30 @@ export default function VoiceRecorder({ userContext, accessToken, onSave, onCanc
               <div className="space-y-2">
                 {extraction.operations.map((op: AIOperation, i: number) => {
                   const meta = typeMeta(op.type);
+                  const currency = op.currency || userContext.primaryCurrency;
+                  const desc = op.notes || op.merchant_or_contact || "Registro por voz";
                   return (
                     <div key={i} className="rounded-xl bg-[#16161F]/60 border border-white/5 p-3 space-y-1.5">
                       <div className="flex items-center gap-2 flex-wrap">
                         <span className={`text-[10px] px-2 py-0.5 rounded-full border font-medium ${meta.cls}`}>{meta.label}</span>
-                        <span className="text-base font-bold text-white">{op.amount.toLocaleString("es-MX")} <span className="text-xs text-gray-500">{userContext.primaryCurrency}</span></span>
-                        <span className="text-xs text-gray-500 ml-auto">{op.date}</span>
+                        <span className="text-base font-bold text-white">
+                          {op.amount == null
+                            ? <span className="text-red-400">Sin monto</span>
+                            : <>{op.amount.toLocaleString("es-MX")} <span className="text-xs text-gray-500">{currency}</span></>}
+                        </span>
+                        <span className="text-xs text-gray-500 ml-auto">{op.date ?? userContext.today}{op.date == null ? " (hoy)" : ""}</span>
                       </div>
-                      <p className="text-sm text-gray-200">{op.description}</p>
-                      {(op.category || op.matchedDebtName || op.matchedContactName) && (
+                      <p className="text-sm text-gray-200">{desc}</p>
+                      {(op.category || op.merchant_or_contact) && (
                         <p className="text-[11px] text-gray-500">
                           {op.category && <span className="mr-2">Cat: <span className="text-gray-300">{op.category}</span></span>}
-                          {op.matchedDebtName && <span className="mr-2">Deuda: <span className="text-amber-300">{op.matchedDebtName}</span></span>}
-                          {op.matchedContactName && <span>Contacto: <span className="text-blue-300">{op.matchedContactName}</span></span>}
+                          {op.merchant_or_contact && <span>Contacto/negocio: <span className="text-blue-300">{op.merchant_or_contact}</span></span>}
                         </p>
                       )}
-                      <p className="text-[10px] text-gray-600">Confianza: {Math.round((op.confidence ?? 0) * 100)}%{op.notes ? ` · ${op.notes}` : ""}</p>
+                      {Array.isArray(op.ambiguities) && op.ambiguities.length > 0 && (
+                        <p className="text-[10px] text-amber-400/80">⚠ {op.ambiguities.join(" · ")}</p>
+                      )}
+                      <p className="text-[10px] text-gray-600">Confianza: {Math.round((op.confidence ?? 0) * 100)}%</p>
                     </div>
                   );
                 })}

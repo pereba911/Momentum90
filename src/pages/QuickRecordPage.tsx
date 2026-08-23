@@ -40,7 +40,7 @@ export default function QuickRecordPage({ data, accessToken, onMutateIncomes, on
     const ops = extraction.operations || [];
     const incomeOps = ops.filter(o => o.type === "income");
     const expenseOps = ops.filter(o => o.type === "expense");
-    const debtOps = ops.filter(o => o.type === "debt");
+    const debtOps = ops.filter(o => o.type === "debt_payment" || o.type === "debt_creation");
 
     if (incomeOps.length > 0) {
       const ok = await onMutateIncomes(prev => [
@@ -49,13 +49,13 @@ export default function QuickRecordPage({ data, accessToken, onMutateIncomes, on
           id: uid(),
           date: o.date || today(),
           type: o.category || "Otro",
-          description: o.description || "Ingreso por voz",
-          amount: Math.round(o.amount),
+          description: o.notes || o.merchant_or_contact || "Ingreso por voz",
+          amount: Math.round(o.amount!),
           status: "Cobrado",
           source: o.category || "Otro",
-          totalAmount: Math.round(o.amount),
-          amountCollected: Math.round(o.amount),
-          paymentHistory: [{ id: uid(), date: o.date || today(), amount: Math.round(o.amount), note: "Registro por voz" }],
+          totalAmount: Math.round(o.amount!),
+          amountCollected: Math.round(o.amount!),
+          paymentHistory: [{ id: uid(), date: o.date || today(), amount: Math.round(o.amount!), note: "Registro por voz" }],
           notes: o.notes || "Registro por voz",
           recordSource: "voice",
         })),
@@ -71,8 +71,8 @@ export default function QuickRecordPage({ data, accessToken, onMutateIncomes, on
           date: o.date || today(),
           category: o.category || "Otros",
           businessCategory: "",
-          description: o.description || "Gasto por voz",
-          amount: Math.round(o.amount),
+          description: o.notes || o.merchant_or_contact || "Gasto por voz",
+          amount: Math.round(o.amount!),
           recordSource: "voice",
         })),
       ]);
@@ -80,20 +80,21 @@ export default function QuickRecordPage({ data, accessToken, onMutateIncomes, on
     }
 
     for (const o of debtOps) {
-      const match = userContext.activeDebts.find(d => o.matchedDebtName && d.name.toLowerCase() === o.matchedDebtName!.toLowerCase());
-      if (match) {
-        const ok = await onMutateDebtPayment(match.id, Math.round(o.amount), o.date || today(), o.notes || "Abono por voz");
+      const nameHint = extraction.matched_debt || o.merchant_or_contact || "";
+      const match = nameHint ? userContext.activeDebts.find(d => d.name.toLowerCase() === nameHint.toLowerCase()) : undefined;
+      if (o.type === "debt_payment" && match) {
+        const ok = await onMutateDebtPayment(match.id, Math.round(o.amount!), o.date || today(), o.notes || "Abono por voz");
         if (!ok) return false;
       } else {
         const ok = await onMutateDebts(prev => [
           ...prev,
           {
             id: uid(),
-            name: o.matchedDebtName || o.description || "Deuda por voz",
-            balance: Math.round(o.amount),
+            name: nameHint || "Deuda por voz",
+            balance: Math.round(o.amount!),
             minPayment: 0,
             targetPayment: 0,
-            originalBalance: Math.round(o.amount),
+            originalBalance: Math.round(o.amount!),
             targetDate: o.date || today(),
             category: o.category,
             notes: o.notes || "Registro por voz",

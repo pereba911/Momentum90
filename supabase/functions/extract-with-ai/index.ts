@@ -36,19 +36,19 @@ app.post("*", async (c) => {
     console.log("[EXTRACT_AI_PATH]", c.req.method, c.req.path);
     const user = await getUser(c.req.header("authorization"));
     if (!user) {
-      return c.json({ error: "No autorizado. Inicia sesión." }, 401);
+      return c.json({ success: false, error: "No autorizado. Inicia sesión." }, 401);
     }
 
     if (!DEEPSEEK_API_KEY) {
-      return c.json({ error: "IA no configurada en el servidor (falta DEEPSEEK_API_KEY)." }, 503);
+      return c.json({ success: false, error: "IA no configurada en el servidor (falta DEEPSEEK_API_KEY)." }, 503);
     }
 
     const body = await c.req.json().catch(() => null);
     const text = String(body?.text ?? "").trim();
     const userContext = body?.userContext as UserContext | undefined;
-    if (!text) return c.json({ error: "Falta el texto a procesar." }, 400);
+    if (!text) return c.json({ success: false, error: "Falta el texto a procesar." }, 400);
     if (!userContext || !Array.isArray(userContext.categories)) {
-      return c.json({ error: "Falta userContext válido." }, 400);
+      return c.json({ success: false, error: "Falta userContext válido." }, 400);
     }
 
     const prompt = `${buildMasterPrompt(userContext)}\n\nTEXTO TRANSCRITO DEL USUARIO:\n"${text}"`;
@@ -70,18 +70,18 @@ app.post("*", async (c) => {
     if (!res.ok) {
       let detail = `HTTP ${res.status}`;
       try { detail = ((await res.json()) as any)?.error?.message || detail; } catch { /* noop */ }
-      return c.json({ error: `Error de DeepSeek (${detail}).` }, 502);
+      return c.json({ success: false, error: `Error de DeepSeek (${detail}).` }, 502);
     }
 
     const data = (await res.json()) as any;
     const content = data?.choices?.[0]?.message?.content;
-    if (!content) return c.json({ error: "La IA no devolvió contenido." }, 502);
+    if (!content) return c.json({ success: false, error: "La IA no devolvió contenido." }, 502);
 
     const extraction = parseExtraction(content);
-    return c.json({ extraction });
+    return c.json({ success: true, data: extraction });
   } catch (e) {
     console.error("[EXTRACT_AI_ERROR]", e);
-    return c.json({ error: "Error interno al extraer con IA." }, 500);
+    return c.json({ success: false, error: "Error interno al extraer con IA." }, 500);
   }
 });
 
