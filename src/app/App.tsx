@@ -118,9 +118,30 @@ interface FinanceAdjustment {
   voided?: boolean;
   voidedAt?: string;
 }
+// ── Flujo de efectivo calculado (capa derivada, aditiva) ──────────────────────
+type CashFlowDirection = "in" | "out" | "internal" | "none";
+type CashFlowMovementType = "colchon" | "inversion" | "transfer" | "commitment";
+interface CashFlowMovement {
+  id: string;
+  type: CashFlowMovementType;
+  label: string;
+  amount: number;
+  date: string;
+  direction: CashFlowDirection;
+  affectsCashFlow: boolean;   // explícito: true = mueve efectivo disponible
+  paymentStatus: "planned" | "paid" | "voided";
+  notes?: string;
+  recordSource?: string;      // "manual" | "voice"
+  createdAt?: string;
+}
 interface AppState {
   finance: { cash: number; receivable: number; totalDebt: number; monthlyExpense: number };
   financeAdjustments: FinanceAdjustment[];
+  // ── Capa de flujo de efectivo calculado (aditiva; nunca toca finance.cash) ──
+  cashFlowStartBalance?: number;          // saldo inicial CONFIRMADO (no se inventa)
+  cashFlowStartDate?: string;             // fecha del saldo inicial (ISO date)
+  cashFlowStartConfirmedAt?: string;      // timestamp de confirmación
+  cashMovements?: CashFlowMovement[];     // colchón / inversión / transferencia / compromiso
   monthlyGoal: { target: number }; quarterlyGoal: { target: number };
   stageNames: [string, string, string];
   currency: Currency;
@@ -431,6 +452,118 @@ function fmtExact(n: number, c: Currency = "MXN"): string {
   return `${sym[c]}${v.toLocaleString("es-MX", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
 
+// ── Flujo de efectivo calculado (capa derivada, auditada, sin doble conteo) ──
+// Helper PURO centralizado: clasifica el efecto de un movimiento sobre el efectivo.
+type CashFlowEffectInput =
+  | { kind: "income_collected"; amount: number }
+  | { kind: "expense_paid"; amount: number }
+  | { kind: "debt_payment"; amount: number }
+  | { kind: "colchon"; amount: number; affectsCashFlow: boolean }
+  | { kind: "inversion"; amount: number; affectsCashFlow: boolean }
+  | { kind: "transfer"; amount: number; direction: "in" | "out" | "internal" }
+  | { kind: "commitment"; amount: number; paymentStatus: "planned" | "paid" }
+  | { kind: "asset"; amount: number; affectsCashFlow: boolean }
+  | { kind: "adjustment"; amount: number };
+function getCashFlowEffect(m: CashFlowEffectInput): { cashIn: number; cashOut: number; net: number; effectType: string; explanation: string } {
+  switch (m.kind) {
+    case "income_collected":
+      return { cashIn: m.amount, cashOut: 0, net: m.amount, effectType: "income", explanation: "Ingreso cobrado: aumenta el efectivo" };
+    case "expense_paid":
+      return { cashIn: 0, cashOut: m.amount, net: -m.amount, effectType: "expense", explanation: "Gasto pagado: reduce el efectivo" };
+    case "debt_payment":
+      return { cashIn: 0, cashOut: m.amount, net: -m.amount, effectType: "debt_payment", explanation: "Abono de deuda: reduce el efectivo y la deuda" };
+    case "colchon":
+      return m.affectsCashFlow
+        ? { cashIn: 0, cashOut: m.amount, net: -m.amount, effectType: "colchon", explanation: "Aporte a colchón: reduce el efectivo (reserva)" }
+        : { cashIn: 0, cashOut: 0, net: 0, effectType: "colchon_none", explanation: "Aporte a colchón sin salida de efectivo (no confirmado)" };
+    case "inversion":
+      return m.affectsCashFlow
+        ? { cashIn: 0, cashOut: m.amount, net: -m.amount, effectType: "inversion", explanation: "Inversión pagada desde efectivo: reduce el efectivo" }
+        : { cashIn: 0, cashOut: 0, net: 0, effectType: "inversion_none", explanation: "Inversión registrada sin salida de efectivo" };
+    case "transfer":
+      if (m.direction === "in") return { cashIn: m.amount, cashOut: 0, net: m.amount, effectType: "transfer_in", explanation: "Transferencia externa entrante: aumenta el efectivo" };
+      if (m.direction === "out") return { cashIn: 0, cashOut: m.amount, net: -m.amount, effectType: "transfer_out", explanation: "Transferencia externa saliente: reduce el efectivo" };
+      return { cashIn: 0, cashOut: 0, net: 0, effectType: "transfer_internal", explanation: "Transferencia interna: sin cambio neto" };
+    case "commitment":
+      return m.paymentStatus === "paid"
+        ? { cashIn: 0, cashOut: m.amount, net: -m.amount, effectType: "commitment_paid", explanation: "Compromiso pagado: reduce el efectivo" }
+        : { cashIn: 0, cashOut: 0, net: 0, effectType: "commitment", explanation: "Compromiso futuro: sin efecto inmediato" };
+    case "asset":
+      return m.affectsCashFlow
+        ? { cashIn: 0, cashOut: m.amount, net: -m.amount, effectType: "asset_paid", explanation: "Activo pagado desde efectivo: reduce el efectivo" }
+        : { cashIn: 0, cashOut: 0, net: 0, effectType: "asset", explanation: "Activo registrado: sin impacto en efectivo" };
+    case "adjustment":
+      return { cashIn: Math.max(0, m.amount), cashOut: Math.max(0, -m.amount), net: m.amount, effectType: "adjustment", explanation: "Ajuste manual: excepción auditada, se muestra por separado" };
+  }
+}
+
+// Entradas reales = ingresos cobrados + transferencias externas entrantes.
+// (Cada abono/ingreso se cuenta una sola vez; pagos voided NO cuentan.)
+function cashInReal(s: AppState): number {
+  const incomes = (s.incomes || []).reduce((a, i) => a + incomeCollected(i), 0);
+  const transfers = (s.cashMovements || [])
+    .filter(m => m.type === "transfer" && m.direction === "in" && m.affectsCashFlow && m.paymentStatus !== "voided")
+    .reduce((a, m) => a + (Number(m.amount) || 0), 0);
+  return incomes + transfers;
+}
+// Salidas reales = gastos + abonos de deuda + colchón/inversión (si salen de
+// efectivo) + transferencias salientes + activos pagados desde efectivo.
+function cashOutReal(s: AppState): number {
+  const expenses = (s.expenses || []).reduce((a, e) => a + (Number(e.amount) || 0), 0);
+  const debtPayments = (s.debts || []).reduce((a, d) =>
+    a + (Array.isArray(d.payments) ? d.payments.filter(p => !p.voided).reduce((x, p) => x + (Number(p.amount) || 0), 0) : 0), 0);
+  const movements = (s.cashMovements || [])
+    .filter(m => m.paymentStatus !== "voided" && m.affectsCashFlow && m.direction === "out")
+    .reduce((a, m) => a + (Number(m.amount) || 0), 0);
+  const assetsPaid = (s.assets || [])
+    .filter(a => a.affectsCashFlow && (a.paymentStatus ?? "paid") !== "voided")
+    .reduce((a, x) => a + (Number(x.value) || 0), 0);
+  return expenses + debtPayments + movements + assetsPaid;
+}
+function flujoNetoCalculado(s: AppState): number { return cashInReal(s) - cashOutReal(s); }
+// Saldo inicial CONFIRMADO: solo existe si el usuario lo configuró explícitamente.
+function saldoInicialConfirmado(s: AppState): number | null {
+  const v = s.cashFlowStartBalance;
+  return typeof v === "number" && Number.isFinite(v) ? v : null;
+}
+// Efectivo disponible calculado = saldo inicial confirmado + flujo neto calculado.
+function efectivoDisponibleCalculado(s: AppState): number | null {
+  const start = saldoInicialConfirmado(s);
+  if (start == null) return null;
+  return start + flujoNetoCalculado(s);
+}
+// Reservas derivadas (colchón / inversión) desde movimientos de flujo no anulados.
+function colchonReservado(s: AppState): number {
+  return (s.cashMovements || []).filter(m => m.type === "colchon" && m.paymentStatus !== "voided").reduce((a, m) => a + (Number(m.amount) || 0), 0);
+}
+function inversionReservada(s: AppState): number {
+  return (s.cashMovements || []).filter(m => m.type === "inversion" && m.paymentStatus !== "voided").reduce((a, m) => a + (Number(m.amount) || 0), 0);
+}
+// Desglose del flujo por categoría (los ajustes manuales van por separado).
+function desgloseFlujo(s: AppState): { label: string; value: number; kind: "in" | "out" }[] {
+  const ingresos = (s.incomes || []).reduce((a, i) => a + incomeCollected(i), 0);
+  const gastos = (s.expenses || []).reduce((a, e) => a + (Number(e.amount) || 0), 0);
+  const abonos = (s.debts || []).reduce((a, d) =>
+    a + (Array.isArray(d.payments) ? d.payments.filter(p => !p.voided).reduce((x, p) => x + (Number(p.amount) || 0), 0) : 0), 0);
+  const colchon = colchonReservado(s);
+  const inversion = inversionReservada(s);
+  const transferIn = (s.cashMovements || []).filter(m => m.type === "transfer" && m.direction === "in" && m.paymentStatus !== "voided").reduce((a, m) => a + (Number(m.amount) || 0), 0);
+  const transferOut = (s.cashMovements || []).filter(m => m.type === "transfer" && m.direction === "out" && m.paymentStatus !== "voided").reduce((a, m) => a + (Number(m.amount) || 0), 0);
+  const activos = (s.assets || []).filter(a => a.affectsCashFlow && (a.paymentStatus ?? "paid") !== "voided").reduce((a, x) => a + (Number(x.value) || 0), 0);
+  const ajustes = ajustesManualesSum(s);
+  const rows: { label: string; value: number; kind: "in" | "out" }[] = [];
+  if (ingresos) rows.push({ label: "Ingresos cobrados", value: ingresos, kind: "in" });
+  if (transferIn) rows.push({ label: "Transferencias entrantes (externas)", value: transferIn, kind: "in" });
+  if (gastos) rows.push({ label: "Gastos pagados", value: gastos, kind: "out" });
+  if (abonos) rows.push({ label: "Abonos de deuda", value: abonos, kind: "out" });
+  if (colchon) rows.push({ label: "Aportes a colchón (reserva)", value: colchon, kind: "out" });
+  if (inversion) rows.push({ label: "Aportes a inversión (reserva)", value: inversion, kind: "out" });
+  if (activos) rows.push({ label: "Activos pagados desde efectivo", value: activos, kind: "out" });
+  if (transferOut) rows.push({ label: "Transferencias salientes (externas)", value: transferOut, kind: "out" });
+  if (ajustes) rows.push({ label: "Ajustes manuales (excepción auditada)", value: ajustes, kind: ajustes >= 0 ? "in" : "out" });
+  return rows;
+}
+
 // ── Metas editables + historial de avances (FASE B) ───────────────────────────
 // Avance acumulado real de una meta = suma de abonos NO anulados; si no hay
 // historial (meta histórica) usa currentAmount tal cual (compatibilidad).
@@ -598,6 +731,7 @@ const INIT: AppState = {
   businesses: [], contacts: [], assets: [],
   recurringExpenses: [],
   monthlyFixedExpense: 0,
+  cashMovements: [],
   miniVictories: [], quarterHistory: [],
   bizStageConfig: undefined, contactStageConfig: undefined,
 };
@@ -1626,6 +1760,14 @@ function MoneyTab({ s, set, hideAmounts, onToggleHide, onMutateIncomes, onMutate
   const [adjForm, setAdjForm] = useState({ amount: "", date: today(), reason: "", note: "" });
   const [adjMsg, setAdjMsg] = useState<string | null>(null);
   const [confirmVoidAdj, setConfirmVoidAdj] = useState<FinanceAdjustment | null>(null);
+  // ── Capa de flujo de efectivo calculado (saldo inicial + movimientos) ──
+  const [showSaldoForm, setShowSaldoForm] = useState(false);
+  const [saldoForm, setSaldoForm] = useState({ balance: "", date: today() });
+  const [saldoMsg, setSaldoMsg] = useState<string | null>(null);
+  const [showMovForm, setShowMovForm] = useState(false);
+  const [movForm, setMovForm] = useState({ type: "colchon" as CashFlowMovementType, label: "", amount: "", date: today(), direction: "out" as CashFlowDirection, affectsCashFlow: true, paymentStatus: "paid" as "planned" | "paid", notes: "" });
+  const [movMsg, setMovMsg] = useState<string | null>(null);
+  const [confirmVoidMov, setConfirmVoidMov] = useState<CashFlowMovement | null>(null);
   // Objetivo 2 — reporte PDF de gastos
   const [repPeriod, setRepPeriod] = useState<"week" | "month" | "quarter" | "custom">("month");
   const [repCustom, setRepCustom] = useState({ from: "", to: "" });
@@ -1696,6 +1838,59 @@ function MoneyTab({ s, set, hideAmounts, onToggleHide, onMutateIncomes, onMutate
     }
     setEditingAdj(null); setAdjForm({ amount: "", date: today(), reason: "", note: "" }); setShowAdjForm(false);
   };
+  // ── Capa de flujo de efectivo calculado: saldo inicial confirmado ──────────
+  const MOV_LABELS: Record<CashFlowMovementType, string> = {
+    colchon: "Aporte a colchón", inversion: "Aporte a inversión", transfer: "Transferencia", commitment: "Compromiso",
+  };
+  const MOV_TYPE_META: Record<CashFlowMovementType, { defaultDirection: CashFlowDirection; defaultAffects: boolean; defaultStatus: "planned" | "paid" }> = {
+    colchon: { defaultDirection: "out", defaultAffects: true, defaultStatus: "paid" },
+    inversion: { defaultDirection: "out", defaultAffects: true, defaultStatus: "paid" },
+    transfer: { defaultDirection: "internal", defaultAffects: false, defaultStatus: "paid" },
+    commitment: { defaultDirection: "none", defaultAffects: false, defaultStatus: "planned" },
+  };
+  const saveSaldoInicial = () => {
+    const balance = Number(saldoForm.balance);
+    if (!Number.isFinite(balance) || !saldoForm.date) { setSaldoMsg("Ingresa un monto válido y una fecha."); return; }
+    set({ ...s, cashFlowStartBalance: balance, cashFlowStartDate: saldoForm.date, cashFlowStartConfirmedAt: new Date().toISOString() });
+    setSaldoMsg(`Saldo inicial confirmado: ${fmtExact(balance, c)} (${saldoForm.date}).`);
+    setShowSaldoForm(false);
+  };
+  const clearSaldoInicial = () => {
+    set({ ...s, cashFlowStartBalance: undefined, cashFlowStartDate: undefined, cashFlowStartConfirmedAt: undefined });
+    setSaldoMsg("Saldo inicial eliminado. El efectivo disponible calculado queda sin saldo de referencia.");
+  };
+  const changeMovType = (type: CashFlowMovementType) => {
+    const meta = MOV_TYPE_META[type];
+    setMovForm(f => ({ ...f, type, direction: meta.defaultDirection, affectsCashFlow: meta.defaultAffects, paymentStatus: meta.defaultStatus, label: MOV_LABELS[type] }));
+  };
+  const saveCashMovement = () => {
+    const amount = Number(movForm.amount);
+    if (!(amount > 0) || !movForm.date) { setMovMsg("Ingresa un monto válido y una fecha."); return; }
+    const nm: CashFlowMovement = {
+      id: uid(),
+      type: movForm.type,
+      label: movForm.label.trim() || MOV_LABELS[movForm.type],
+      amount,
+      date: movForm.date,
+      direction: movForm.direction,
+      affectsCashFlow: movForm.affectsCashFlow,
+      paymentStatus: movForm.paymentStatus,
+      notes: movForm.notes.trim() || undefined,
+      recordSource: "manual",
+      createdAt: new Date().toISOString(),
+    };
+    set({ ...s, cashMovements: [...(s.cashMovements || []), nm] });
+    setMovMsg("Movimiento registrado en el flujo.");
+    setMovForm({ type: "colchon", label: "", amount: "", date: today(), direction: "out", affectsCashFlow: true, paymentStatus: "paid", notes: "" });
+    setShowMovForm(false);
+  };
+  const voidCashMovement = (m: CashFlowMovement) => {
+    set({ ...s, cashMovements: (s.cashMovements || []).map(x => x.id === m.id ? { ...x, paymentStatus: "voided", notes: x.notes ? `${x.notes} · Anulado` : "Anulado" } : x) });
+    setConfirmVoidMov(null);
+  };
+  const deleteCashMovement = (id: string) => {
+    set({ ...s, cashMovements: (s.cashMovements || []).filter(x => x.id !== id) });
+  };
   const mColl = calcMonthlyCollected(s.incomes); const qColl = calcQCollected(s.incomes);
   const q = getQ(); const qMo: Record<number, string> = { 1: "Ene–Mar", 2: "Abr–Jun", 3: "Jul–Sep", 4: "Oct–Dic" };
   const expByCat = s.expenses.reduce<Record<string, number>>((a, e) => { a[e.category] = (a[e.category] || 0) + e.amount; return a; }, {});
@@ -1737,6 +1932,134 @@ function MoneyTab({ s, set, hideAmounts, onToggleHide, onMutateIncomes, onMutate
           <div className="bg-[#0D0D12] rounded-xl p-3 border border-white/5 mb-4" title="Efectivo cobrado (auto) + ajustes manuales. Vista derivada; NO sustituye ni se suma al saldo manual (finance.cash).">
             <p className="text-[11px] text-gray-500 mb-1">Total líquido calculado <span className="text-gray-600">= efectivo cobrado (auto) + ajustes manuales</span></p>
             <p className="text-lg font-black text-[#c084fc]">{fmtExact(totalLiquidoCalculado(s), c)}</p>
+          </div>
+          {/* Capa de flujo de efectivo calculado (derivada, auditada) */}
+          <div className="mb-4">
+            <div className="flex items-center justify-between mb-2">
+              <p className="text-[11px] text-gray-500 uppercase tracking-wider">Flujo de efectivo calculado <span className="text-gray-600 normal-case">(derivado · no toca finance.cash)</span></p>
+              <button onClick={() => { setShowMovForm(!showMovForm); setMovMsg(null); }} className="text-xs text-[#c084fc] hover:text-[#9D4EDD]"><Plus size={12} /> Movimiento</button>
+            </div>
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-3">
+              {[
+                { l: "Flujo neto calculado", v: fmtExact(flujoNetoCalculado(s), c), color: flujoNetoCalculado(s) >= 0 ? "text-emerald-400" : "text-red-400", tip: "Entradas reales − salidas reales (ingresos cobrados, gastos, abonos, reservas, transferencias externas, activos pagados). Los ajustes manuales NO se mezclan." },
+                { l: "Entradas reales", v: fmtExact(cashInReal(s), c), color: "text-emerald-400", tip: "Ingresos cobrados + transferencias externas entrantes. Cada cobro se cuenta una sola vez." },
+                { l: "Salidas reales", v: fmtExact(cashOutReal(s), c), color: "text-red-400", tip: "Gastos pagados + abonos de deuda + reservas (colchón/inversión) + transferencias salientes + activos pagados desde efectivo." },
+                { l: "Efectivo disponible calculado", v: efectivoDisponibleCalculado(s) == null ? "—" : fmtExact(efectivoDisponibleCalculado(s)!, c), color: "text-white", tip: "Saldo inicial confirmado + flujo neto calculado. Solo existe si configuras el saldo inicial." },
+              ].map(x => (
+                <div key={x.l} className="bg-[#0D0D12] rounded-xl p-3 border border-white/5" title={x.tip}>
+                  <p className="text-[11px] text-gray-500 mb-1">{x.l}</p>
+                  <p className={`font-bold text-sm ${x.color}`}>{x.v}</p>
+                </div>
+              ))}
+            </div>
+            {/* Saldo inicial confirmado */}
+            <div className="bg-[#0D0D12] rounded-xl p-3 border border-white/5 mb-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div>
+                  <p className="text-[11px] text-gray-500 mb-0.5">Saldo inicial confirmado</p>
+                  {saldoInicialConfirmado(s) == null
+                    ? <p className="text-xs text-amber-400/90">Configura saldo inicial para calcular efectivo disponible.</p>
+                    : <p className="text-sm font-bold text-white">{fmtExact(saldoInicialConfirmado(s)!, c)} <span className="text-[11px] text-gray-500">· desde {s.cashFlowStartDate || "—"}</span></p>}
+                </div>
+                <div className="flex gap-2">
+                  {saldoInicialConfirmado(s) != null && <button onClick={clearSaldoInicial} className="text-[11px] text-gray-500 hover:text-red-400">Quitar</button>}
+                  <button onClick={() => setShowSaldoForm(!showSaldoForm)} className="text-xs text-[#c084fc] hover:text-[#9D4EDD]">{saldoInicialConfirmado(s) == null ? "Configurar" : "Editar"}</button>
+                </div>
+              </div>
+              {showSaldoForm && (
+                <div className="mt-2 grid grid-cols-1 sm:grid-cols-3 gap-2 items-end">
+                  <div><label className="text-[11px] text-gray-500 block mb-1">Saldo inicial ({c})</label><input type="number" value={saldoForm.balance} onChange={e => setSaldoForm({ ...saldoForm, balance: e.target.value })} placeholder="10000" className="w-full bg-[#16161F] border border-white/10 text-white rounded-xl px-3 py-2 text-sm focus:outline-none" aria-label="Saldo inicial" /></div>
+                  <div><label className="text-[11px] text-gray-500 block mb-1">Fecha</label><input type="date" value={saldoForm.date} onChange={e => setSaldoForm({ ...saldoForm, date: e.target.value })} className="w-full bg-[#16161F] border border-white/10 text-white rounded-xl px-3 py-2 text-sm focus:outline-none" aria-label="Fecha saldo inicial" /></div>
+                  <div className="flex gap-2">
+                    <button onClick={saveSaldoInicial} className="px-3 py-2 bg-[#9D4EDD] text-white rounded-xl text-xs font-medium">Confirmar</button>
+                    <button onClick={() => setShowSaldoForm(false)} className="px-3 py-2 bg-white/5 text-gray-400 rounded-xl text-xs">Cancelar</button>
+                  </div>
+                </div>
+              )}
+              {saldoMsg && <p className="text-[11px] text-gray-400 mt-2">{saldoMsg}</p>}
+            </div>
+            {/* Formulario de movimiento */}
+            {showMovForm && (
+              <div className="bg-[#0D0D12] rounded-xl p-3 border border-white/5 mb-3 space-y-2">
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                  <select value={movForm.type} onChange={e => changeMovType(e.target.value as CashFlowMovementType)} className="bg-[#16161F] border border-white/10 text-white rounded-xl px-3 py-2 text-sm focus:outline-none" aria-label="Tipo de movimiento">
+                    <option value="colchon">🛟 Aporte a colchón</option>
+                    <option value="inversion">📈 Aporte a inversión</option>
+                    <option value="transfer">🔁 Transferencia</option>
+                    <option value="commitment">📌 Compromiso</option>
+                  </select>
+                  <input type="number" value={movForm.amount} onChange={e => setMovForm({ ...movForm, amount: e.target.value })} placeholder="Monto" className="bg-[#16161F] border border-white/10 text-white rounded-xl px-3 py-2 text-sm placeholder-gray-700 focus:outline-none" aria-label="Monto del movimiento" />
+                  <input type="date" value={movForm.date} onChange={e => setMovForm({ ...movForm, date: e.target.value })} className="bg-[#16161F] border border-white/10 text-white rounded-xl px-3 py-2 text-sm focus:outline-none" aria-label="Fecha del movimiento" />
+                  <input value={movForm.label} onChange={e => setMovForm({ ...movForm, label: e.target.value })} placeholder="Etiqueta (opcional)" className="bg-[#16161F] border border-white/10 text-white rounded-xl px-3 py-2 text-sm placeholder-gray-700 focus:outline-none" aria-label="Etiqueta del movimiento" />
+                </div>
+                <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                  {movForm.type === "transfer" ? (
+                    <select value={movForm.direction} onChange={e => { const d = e.target.value as CashFlowDirection; setMovForm(f => ({ ...f, direction: d, affectsCashFlow: d !== "internal" })); }} className="bg-[#16161F] border border-white/10 text-white rounded-xl px-3 py-2 text-sm focus:outline-none" aria-label="Dirección de la transferencia">
+                      <option value="internal">Interna (sin cambio neto)</option>
+                      <option value="out">Salida externa</option>
+                      <option value="in">Entrada externa</option>
+                    </select>
+                  ) : movForm.type === "commitment" ? (
+                    <select value={movForm.paymentStatus} onChange={e => setMovForm(f => ({ ...f, paymentStatus: e.target.value as "planned" | "paid", affectsCashFlow: e.target.value === "paid" }))} className="bg-[#16161F] border border-white/10 text-white rounded-xl px-3 py-2 text-sm focus:outline-none" aria-label="Estado del compromiso">
+                      <option value="planned">Futuro (sin efecto)</option>
+                      <option value="paid">Pagado (sale de efectivo)</option>
+                    </select>
+                  ) : (
+                    <label className="flex items-center gap-2 text-xs text-gray-400 px-1 py-2">
+                      <input type="checkbox" checked={movForm.affectsCashFlow} onChange={e => setMovForm({ ...movForm, affectsCashFlow: e.target.checked })} className="accent-[#9D4EDD]" />
+                      ¿Salió de efectivo disponible?
+                    </label>
+                  )}
+                  <input value={movForm.notes} onChange={e => setMovForm({ ...movForm, notes: e.target.value })} placeholder="Nota (opcional)" className="bg-[#16161F] border border-white/10 text-white rounded-xl px-3 py-2 text-sm placeholder-gray-700 focus:outline-none" aria-label="Nota del movimiento" />
+                  <div className="flex gap-2 items-end">
+                    <button onClick={saveCashMovement} className="px-3 py-2 bg-[#9D4EDD] text-white rounded-xl text-xs font-medium">Registrar</button>
+                    <button onClick={() => setShowMovForm(false)} className="px-3 py-2 bg-white/5 text-gray-400 rounded-xl text-xs">Cancelar</button>
+                  </div>
+                </div>
+                {movMsg && <p className="text-[11px] text-gray-400">{movMsg}</p>}
+              </div>
+            )}
+            {/* Reservas */}
+            {(colchonReservado(s) !== 0 || inversionReservada(s) !== 0) && (
+              <div className="grid grid-cols-2 gap-3 mb-3">
+                {colchonReservado(s) !== 0 && <div className="bg-[#0D0D12] rounded-xl p-3 border border-emerald-500/15"><p className="text-[11px] text-gray-500 mb-0.5">Colchón reservado</p><p className="font-bold text-sm text-emerald-400">{fmtExact(colchonReservado(s), c)}</p></div>}
+                {inversionReservada(s) !== 0 && <div className="bg-[#0D0D12] rounded-xl p-3 border border-[#9D4EDD]/15"><p className="text-[11px] text-gray-500 mb-0.5">Inversión reservada</p><p className="font-bold text-sm text-[#c084fc]">{fmtExact(inversionReservada(s), c)}</p></div>}
+              </div>
+            )}
+            {/* Desglose */}
+            {desgloseFlujo(s).length > 0 && (
+              <div className="bg-[#0D0D12] rounded-xl p-3 border border-white/5">
+                <p className="text-[11px] text-gray-500 uppercase tracking-wider mb-2">Desglose del flujo</p>
+                <div className="space-y-1">
+                  {desgloseFlujo(s).map(r => (
+                    <div key={r.label} className="flex items-center justify-between text-xs py-0.5">
+                      <span className="text-gray-400">{r.label}</span>
+                      <span className={`font-bold ${r.kind === "in" ? "text-emerald-400" : "text-red-400"}`}>{r.kind === "in" ? "+" : "−"}{fmtExact(Math.abs(r.value), c)}</span>
+                    </div>
+                  ))}
+                </div>
+                <p className="text-[10px] text-gray-600 mt-2">Los ajustes manuales se muestran aparte (excepción auditada) y no forman parte del flujo neto. Nunca se suman finance.cash + efectivo calculado.</p>
+              </div>
+            )}
+            {/* Lista de movimientos */}
+            {(s.cashMovements || []).length > 0 && (
+              <div className="mt-2 space-y-1">
+                <p className="text-[11px] text-gray-500 uppercase tracking-wider mb-1">Movimientos de flujo</p>
+                {(s.cashMovements || []).slice().reverse().slice(0, 15).map(m => (
+                  <div key={m.id} className={`flex items-center gap-2 text-xs py-1.5 border-b border-white/5 ${m.paymentStatus === "voided" ? "opacity-50" : ""}`}>
+                    <span className="text-gray-500 w-20 shrink-0">{m.date}</span>
+                    <span className={`font-bold ${m.paymentStatus === "voided" ? "text-gray-500" : m.affectsCashFlow && m.direction === "out" ? "text-red-400" : m.affectsCashFlow && m.direction === "in" ? "text-emerald-400" : "text-gray-400"}`}>
+                      {m.paymentStatus === "voided" ? "Anulado" : `${m.affectsCashFlow ? (m.direction === "in" ? "+" : "−") : "·"}${fmtExact(Math.abs(Number(m.amount) || 0), c)}`}
+                    </span>
+                    <span className="text-gray-400 truncate flex-1">{m.label}{m.notes ? ` · ${m.notes}` : ""}</span>
+                    {m.paymentStatus !== "voided" && (<>
+                      <button onClick={() => voidCashMovement(m)} className="text-gray-600 hover:text-amber-400" aria-label="Anular movimiento">Anular</button>
+                      <button onClick={() => deleteCashMovement(m.id)} className="text-gray-600 hover:text-red-400" aria-label="Eliminar movimiento"><Trash2 size={11} /></button>
+                    </>)}
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
           {/* Ajustes manuales (capa auditable) */}
           <div className="mb-4">
@@ -2780,7 +3103,7 @@ function AssetsTab({ s, set, hideAmounts, onToggleHide }: { s: AppState; set: (x
   const c = s.currency;
   const [showForm, setShowForm] = useState(false);
   const [editId, setEditId] = useState<string | null>(null);
-  const [na, setNa] = useState({ name: "", type: "cash" as AssetType, value: "", notes: "" });
+  const [na, setNa] = useState({ name: "", type: "cash" as AssetType, value: "", notes: "", affectsCashFlow: false });
   const assets = s.assets || [];
   const byType = ASSET_TYPES.map(t => ({ ...t, items: assets.filter(a => a.type === t.id), subtotal: assets.filter(a => a.type === t.id).reduce((a2, x) => a2 + x.value, 0) })).filter(t => t.subtotal > 0 || t.items.length > 0);
   // FASE B — fórmulas aprobadas.
@@ -2790,7 +3113,7 @@ function AssetsTab({ s, set, hideAmounts, onToggleHide }: { s: AppState; set: (x
   const { byCat, byStage } = desglosePotenciales(s);
   const potentialItems = (s.businesses || []).filter(b => Number(b.value) > 0);
 
-  const startEdit = (a: Asset) => { setEditId(a.id); setNa({ name: a.name, type: a.type, value: String(a.value), notes: a.notes ?? "" }); setShowForm(true); };
+  const startEdit = (a: Asset) => { setEditId(a.id); setNa({ name: a.name, type: a.type, value: String(a.value), notes: a.notes ?? "", affectsCashFlow: a.affectsCashFlow === true }); setShowForm(true); };
   const save = () => {
     if (!na.name.trim()) return;
     const asset: Asset = {
@@ -2801,9 +3124,13 @@ function AssetsTab({ s, set, hideAmounts, onToggleHide }: { s: AppState; set: (x
       updatedAt: today(),
       notes: na.notes || undefined,
       createdAt: editId ? (assets.find(a => a.id === editId)?.createdAt ?? today()) : today(),
+      affectsCashFlow: na.affectsCashFlow,
+      cashFlowDirection: na.affectsCashFlow ? "out" : undefined,
+      paymentStatus: na.affectsCashFlow ? "paid" : undefined,
+      recordSource: "manual",
     };
     set(editId ? { ...s, assets: assets.map(a => a.id === editId ? asset : a) } : { ...s, assets: [...assets, asset] });
-    setNa({ name: "", type: "cash", value: "", notes: "" }); setEditId(null); setShowForm(false);
+    setNa({ name: "", type: "cash", value: "", notes: "", affectsCashFlow: false }); setEditId(null); setShowForm(false);
   };
 
   return (
@@ -2880,7 +3207,7 @@ function AssetsTab({ s, set, hideAmounts, onToggleHide }: { s: AppState; set: (x
       <Card>
         <div className="flex items-center justify-between mb-1">
           <p className="text-xs text-gray-500 uppercase tracking-wider">Activos registrados manualmente</p>
-          <div className="flex items-center gap-1"><EyeToggle hidden={hideAmounts} onToggle={onToggleHide} /><button onClick={() => { setEditId(null); setNa({ name: "", type: "cash", value: "", notes: "" }); setShowForm(!showForm); }} className="flex items-center gap-1.5 text-xs text-[#c084fc] hover:text-[#9D4EDD]"><Plus size={13} /> Agregar activo</button></div>
+          <div className="flex items-center gap-1"><EyeToggle hidden={hideAmounts} onToggle={onToggleHide} /><button onClick={() => { setEditId(null); setNa({ name: "", type: "cash", value: "", notes: "", affectsCashFlow: false }); setShowForm(!showForm); }} className="flex items-center gap-1.5 text-xs text-[#c084fc] hover:text-[#9D4EDD]"><Plus size={13} /> Agregar activo</button></div>
         </div>
         <p className="text-[11px] text-gray-600 mb-3">Bloque independiente: no se suma automáticamente al Total de activos ni a Activos potenciales. La clasificación de cada activo (líquido / no líquido / potencial) no es inequívoca en el modelo actual; se muestra por separado hasta definirla explícitamente.</p>
 
@@ -2894,6 +3221,10 @@ function AssetsTab({ s, set, hideAmounts, onToggleHide }: { s: AppState; set: (x
               <input type="number" value={na.value} onChange={e => setNa({ ...na, value: e.target.value })} placeholder={`Valor en ${c} (pesos enteros)`} className="bg-[#16161F] border border-white/10 text-white rounded-xl px-3 py-2 text-sm placeholder-gray-700 focus:outline-none" />
             </div>
             <input value={na.notes} onChange={e => setNa({ ...na, notes: e.target.value })} placeholder="Notas (opcional)" className="w-full bg-[#16161F] border border-white/10 text-white rounded-xl px-3 py-2 text-sm placeholder-gray-700 focus:outline-none" />
+            <label className="flex items-center gap-2 text-xs text-gray-400">
+              <input type="checkbox" checked={na.affectsCashFlow} onChange={e => setNa({ ...na, affectsCashFlow: e.target.checked })} className="accent-[#9D4EDD]" />
+              ¿Se pagó desde efectivo disponible? <span className="text-gray-600">(si activas, reduce el efectivo disponible calculado)</span>
+            </label>
             <div className="flex gap-2">
               <button onClick={save} className="px-3 py-1.5 bg-[#9D4EDD] text-white rounded-xl text-xs hover:bg-[#7B2CBF]">Guardar</button>
               <button onClick={() => setShowForm(false)} className="px-3 py-1.5 bg-white/5 text-gray-400 rounded-xl text-xs">Cancelar</button>
@@ -2914,6 +3245,7 @@ function AssetsTab({ s, set, hideAmounts, onToggleHide }: { s: AppState; set: (x
                 {t.items.map(a => (
                   <div key={a.id} className="group flex items-center gap-2 rounded-lg bg-[#16161F]/60 px-2.5 py-1.5">
                     <span className="text-sm text-gray-300 flex-1">{a.name}</span>
+                    {a.affectsCashFlow && <span className="text-[9px] px-1.5 py-0.5 rounded-full bg-red-500/10 text-red-400 border border-red-500/25" title="Pagado desde efectivo disponible">efectivo −</span>}
                     {a.notes && <span className="text-[10px] text-gray-600 truncate max-w-[160px]">{a.notes}</span>}
                     <span className="text-xs text-gray-400">{a.updatedAt}</span>
                     <span className="text-sm font-semibold text-white">{fmtExact(a.value, c)}</span>

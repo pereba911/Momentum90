@@ -70,17 +70,19 @@ export function validateExtraction(extraction: AIExtraction | null, ctx: UserCon
       warnings.push({ field: `${label}.category`, message: `La categoría "${op.category}" no existe en tu contexto (se guardará igual).` });
     }
 
-    // Deuda no reconocida (para abonos/creación de deuda)
-    const debtHint = extraction.matched_debt || op.merchant_or_contact || "";
-    if ((op.type === "debt_payment" || op.type === "debt_creation") && debtHint) {
-      const known = ctx.activeDebts.some(d => d.name.toLowerCase() === debtHint.toLowerCase());
-      if (!known) {
-        warnings.push({
-          field: `${label}.debt`,
-          message: op.type === "debt_payment"
-            ? `"${debtHint}" no coincide con tus deudas registradas (se creará una nueva deuda).`
-            : `"${debtHint}" no coincide con deudas conocidas (se creará una nueva deuda).`,
-        });
+    // Abono de deuda: exige una deuda ÚNICA identificada (nunca elegir una errónea).
+    if (op.type === "debt_payment") {
+      const hint = extraction.matched_debt || op.merchant_or_contact || "";
+      const matches = hint ? ctx.activeDebts.filter(d => d.name.toLowerCase() === hint.toLowerCase()) : [];
+      if (matches.length === 0) {
+        errors.push({ field: `${label}.debt`, message: "No se identificó una deuda única para el abono. Selecciona o crea la deuda antes." });
+      } else if (matches.length > 1) {
+        errors.push({ field: `${label}.debt`, message: `Hay ${matches.length} deudas que coinciden con "${hint}". Sé más específico.` });
+      }
+    } else if (op.type === "debt_creation" && (extraction.matched_debt || op.merchant_or_contact)) {
+      const hint = extraction.matched_debt || op.merchant_or_contact || "";
+      if (!ctx.activeDebts.some(d => d.name.toLowerCase() === hint.toLowerCase())) {
+        warnings.push({ field: `${label}.debt`, message: `"${hint}" no coincide con deudas conocidas (se creará una nueva deuda).` });
       }
     }
 
@@ -107,4 +109,31 @@ export function validateExtraction(extraction: AIExtraction | null, ctx: UserCon
   });
 
   return { errors, warnings, canProceed: errors.length === 0 };
+}
+
+// Efecto esperado sobre el efectivo disponible de una propuesta de IA (bandeja).
+export function aiOpCashEffect(op: AIOperation, ctx: UserContext): { label: string; direction: "in" | "out" | "none"; amount: number; cls: string } {
+  const amt = op.amount ?? 0;
+  const fmtA = (n: number) => `${n.toLocaleString("es-MX")} ${ctx.primaryCurrency}`;
+  switch (op.type) {
+    case "income":
+      return { label: `Efecto esperado: +${fmtA(amt)} al efectivo`, direction: "in", amount: amt, cls: "text-emerald-400" };
+    case "expense":
+      return { label: `Efecto esperado: −${fmtA(amt)} al efectivo`, direction: "out", amount: amt, cls: "text-red-400" };
+    case "debt_payment":
+      return { label: `Efecto esperado: −${fmtA(amt)} al efectivo (y reduce la deuda)`, direction: "out", amount: amt, cls: "text-red-400" };
+    case "debt_creation":
+      return { label: "Sin efecto inmediato: se crea una deuda (no mueve efectivo)", direction: "none", amount: 0, cls: "text-gray-400" };
+    case "commitment":
+      return { label: "Sin efecto inmediato: compromiso futuro (proyección pendiente)", direction: "none", amount: 0, cls: "text-sky-400" };
+    case "asset":
+      return { label: "Sin efecto inmediato: activo (requiere confirmar si salió de efectivo)", direction: "none", amount: 0, cls: "text-violet-400" };
+    case "transfer":
+      return { label: "Sin efecto inmediato: transferencia (requiere origen/destino)", direction: "none", amount: 0, cls: "text-cyan-400" };
+    case "income_payment":
+      return { label: "Sin efecto inmediato: cobro de ingreso por cobrar (por confirmar)", direction: "none", amount: 0, cls: "text-emerald-400" };
+    case "unknown":
+    default:
+      return { label: "Sin efecto: mensaje sin información financiera", direction: "none", amount: 0, cls: "text-gray-400" };
+  }
 }

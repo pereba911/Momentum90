@@ -4,7 +4,7 @@ import {
 } from "lucide-react";
 import { isSpeechSupported, startSpeechRecognition, type ActiveRecognition } from "../utils/speechToText";
 import { extractWithAI, type AIExtraction, type AIOperation, type UserContext } from "../utils/extractWithAI";
-import { validateExtraction, type ValidationResult } from "../utils/validateExtraction";
+import { validateExtraction, aiOpCashEffect, type ValidationResult } from "../utils/validateExtraction";
 
 const MAX_SECONDS = 10;
 const TYPE_META: Record<string, { label: string; cls: string }> = {
@@ -266,6 +266,7 @@ export default function VoiceRecorder({ userContext, accessToken, onSave, onCanc
                         </span>
                         <span className="text-xs text-gray-500 ml-auto">{op.date ?? userContext.today}{op.date == null ? " (hoy)" : ""}</span>
                       </div>
+                      <p className={`text-[11px] font-medium ${aiOpCashEffect(op, userContext).cls}`}>{aiOpCashEffect(op, userContext).label}</p>
                       <p className="text-sm text-gray-200">{desc}</p>
                       {(op.category || op.merchant_or_contact) && (
                         <p className="text-[11px] text-gray-500">

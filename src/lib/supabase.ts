@@ -75,6 +75,11 @@ export interface Asset {
   updatedAt: string;  // fecha de actualización (YYYY-MM-DD)
   notes?: string;
   createdAt: string;
+  // ── Flujo de efectivo (aditivo, opcional — compatibilidad con activos históricos) ──
+  affectsCashFlow?: boolean;                    // true = se pagó desde efectivo disponible
+  cashFlowDirection?: "in" | "out" | "internal" | "none";
+  paymentStatus?: "planned" | "paid" | "voided";
+  recordSource?: string;                        // "voice" | "manual"
 }
 
 export interface IntegrationConfig {
