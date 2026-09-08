@@ -4463,15 +4463,10 @@ export default function App() {
     { id: "habitos", label: "Hábitos", short: "Hábitos", icon: <Flame size={16} /> },
     { id: "tareas", label: "Tareas", short: "Tareas", icon: <CheckSquare size={16} />, badge: keyDone < 3 ? keyDone : undefined },
     { id: "logros", label: "Logros", short: "Logros", icon: <Trophy size={16} />, badge: completedGoals || undefined },
-    { id: "oportunidades", label: "Oportunidades", short: "Oport.", icon: <Building2 size={16} />, badge: hotProps || undefined },
-  ];
-  // Referencia financiera Momentum 90 (datos conservados, no es un módulo principal).
-  const FIN_TABS: TabDef[] = [
-    { id: "finanzas", label: "Registro financiero · Momentum 90", short: "M90", icon: <Zap size={16} /> },
-    { id: "activos", label: "Activos", short: "Activos", icon: <Wallet size={16} /> },
+    { id: "oportunidades", label: "CRM", short: "CRM", icon: <Building2 size={16} />, badge: hotProps || undefined },
   ];
   const ADMIN_TABS: TabDef[] = profile?.role === "admin" ? [{ id: "admin" as AppTab, label: "Admin", short: "Admin", icon: <ShieldCheck size={16} /> }] : [];
-  const activeTabLabel = [...MAIN_TABS, ...FIN_TABS, ...ADMIN_TABS].find(t => t.id === tab)?.label ?? "Hoy";
+  const activeTabLabel = [...MAIN_TABS, ...ADMIN_TABS].find(t => t.id === tab)?.label ?? "Hoy";
 
   return (
     <div className="min-h-screen bg-[#0B0B0E] text-white" style={{ fontFamily: "'Inter', sans-serif" }}>
@@ -4518,15 +4513,6 @@ export default function App() {
             </button>
           ))}
         </nav>
-        <div className="pt-4 border-t border-white/5 space-y-1">
-          <p className="text-[9px] uppercase tracking-wider text-gray-700 px-2 mb-1">Datos Momentum 90 · referencia</p>
-          {FIN_TABS.map(t => (
-            <button key={t.id} onClick={() => setTab(t.id)} className={`w-full flex items-center gap-3 px-3 py-2 rounded-xl text-xs font-medium transition-all ${tab === t.id ? "bg-[#9D4EDD]/15 text-[#c084fc] border border-[#9D4EDD]/25" : "text-gray-600 hover:text-gray-300 hover:bg-white/5"}`}>
-              {t.icon} {t.short === "M90" ? "Registro financiero" : t.label}
-              {t.short === "M90" && <span className="ml-auto text-[9px] text-gray-700 border border-white/10 rounded px-1 py-0.5">M90</span>}
-            </button>
-          ))}
-        </div>
         <div className="pt-3 mt-2 border-t border-white/5 space-y-2">
           <button onClick={() => setShowSettings(!showSettings)} className="w-full flex items-center gap-2 px-3 py-2 rounded-xl text-gray-500 hover:text-gray-200 hover:bg-white/5 text-sm font-medium transition-all"><Settings size={14} /> Ajustes</button>
           <p className="text-[10px] text-gray-700 px-1">Goal Assistant 90 · Q{getQ()} {getQYear()} · Día {dayOfQNow()}/{getQTotalDays(getQ(), getQYear())}</p>
@@ -4572,19 +4558,6 @@ export default function App() {
           {tab === "tareas" && <TasksTab s={data} set={setData} />}
           {tab === "logros" && <LogrosTab s={data} set={setData} />}
           {tab === "oportunidades" && <CRMTab s={data} set={setData} />}
-          {tab === "finanzas" && (
-            <div className="space-y-5">
-              <div className="rounded-2xl border border-[#9D4EDD]/15 bg-[#9D4EDD]/5 p-4 flex items-start gap-3">
-                <Zap size={18} className="text-[#c084fc] mt-0.5 shrink-0" />
-                <div>
-                  <p className="text-sm font-semibold text-white">Registro financiero · Momentum 90 (referencia)</p>
-                  <p className="text-xs text-gray-500 mt-0.5">Datos financieros históricos conservados íntegros. Goal Assistant 90 no crea una segunda contabilidad: este es el registro de origen de Momentum 90.</p>
-                </div>
-              </div>
-              <MoneyTab s={data} set={setData} hideAmounts={hideAmounts} onToggleHide={toggleHideAmounts} onMutateIncomes={mutateIncomes} onMutateDebts={mutateDebts} />
-            </div>
-          )}
-          {tab === "activos" && <AssetsTab s={data} set={setData} hideAmounts={hideAmounts} onToggleHide={toggleHideAmounts} />}
           {tab === "admin" && profile?.role === "admin" && <AdminDashboard accessToken={session?.access_token} profile={profile} />}
         </main>
       </div>
@@ -4608,12 +4581,6 @@ export default function App() {
             </button>
           ))}
           <div className="w-px h-8 bg-white/10 shrink-0 mx-0.5" aria-hidden="true" />
-          {FIN_TABS.map(t => (
-            <button key={t.id} id={`tab-${t.id}`} onClick={() => setTab(t.id)} className={`flex flex-col items-center gap-0.5 py-1.5 px-3 min-w-[52px] rounded-xl transition-all relative shrink-0 ${tab === t.id ? "text-[#c084fc] bg-[#9D4EDD]/10" : "text-gray-700 hover:text-gray-400"}`} title={t.label}>
-              {t.icon}
-              <span className="text-[9px] font-medium">{t.short}</span>
-            </button>
-          ))}
           <button onClick={() => setShowSettings(true)} className="flex flex-col items-center gap-0.5 py-1.5 px-3 min-w-[52px] rounded-xl transition-all relative shrink-0 text-gray-600 hover:text-gray-400">
             <Settings size={16} />
             <span className="text-[9px] font-medium">Ajustes</span>

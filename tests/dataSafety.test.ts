@@ -105,27 +105,27 @@ describe("Rebranding a Goal Assistant 90", () => {
 });
 
 describe("Navegación: áreas principales de Goal Assistant 90", () => {
-  it("las 8 áreas incluyen Hoy como pantalla inicial y 7 módulos principales", () => {
+  it("menú principal = Hoy, Metas, Plan, Hábitos, Tareas, Logros y CRM (sin M90 ni Activos)", () => {
     const mainStart = app.indexOf("const MAIN_TABS: TabDef[] = [");
-    const mainEnd = app.indexOf("const FIN_TABS: TabDef[] = [");
-    const finStart = mainEnd;
-    const finEnd = app.indexOf("const ADMIN_TABS: TabDef[] =");
+    const mainEnd = app.indexOf("const ADMIN_TABS: TabDef[] =");
     expect(mainStart).toBeGreaterThan(-1);
     expect(mainEnd).toBeGreaterThan(mainStart);
-    expect(finEnd).toBeGreaterThan(finStart);
     const mainBlock = app.slice(mainStart, mainEnd);
-    const finBlock = app.slice(finStart, finEnd);
 
     for (const id of ["hoy", "metas", "plan", "habitos", "tareas", "logros", "oportunidades"]) {
       expect(mainBlock, `MAIN_TABS debe incluir ${id}`).toContain(`id: "${id}"`);
     }
+    // El área de oportunidades se muestra como CRM
+    expect(app).toContain('id: "oportunidades", label: "CRM"');
     // Módulos financieros NO son áreas principales
     for (const fin of ["dashboard", "money", "capital", "crm", "finanzas", "activos"]) {
       expect(mainBlock, `MAIN_TABS no debe incluir ${fin}`).not.toContain(`id: "${fin}"`);
     }
-    // El registro financiero (referencia Momentum 90) se conserva como área secundaria
-    expect(finBlock).toContain('id: "finanzas"');
-    expect(finBlock).toContain('id: "activos"');
+    // El menú ya NO muestra la referencia financiera (M90) ni Activos como opción
+    expect(app).not.toContain("const FIN_TABS");
+    expect(app).not.toContain('short: "M90"');
+    expect(app).not.toMatch(/tab === "finanzas"/);
+    expect(app).not.toMatch(/tab === "activos"/);
   });
 
   it("la pantalla inicial por defecto es Hoy", () => {
