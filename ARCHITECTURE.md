@@ -1,6 +1,11 @@
-# Momentum 90 — Arquitectura
+# Goal Assistant 90 — Arquitectura
 
 Documento de referencia arquitectónica del proyecto. La fuente de verdad operativa es el código y esta política.
+
+> **Producto:** Goal Assistant 90 — ejecución personal, metas, plan 90/120, hábitos,
+> tareas, logros y oportunidades. Los datos financieros históricos de Momentum 90
+> (la referencia financiera externa) se conservan íntegros en el registro secundario
+> "Registro financiero · Momentum 90 (referencia)" y nunca se borran ni se duplican.
 
 ---
 

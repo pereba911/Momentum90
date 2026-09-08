@@ -1,16 +1,16 @@
 import { useState, useEffect, useRef, type ReactNode } from "react";
 import {
-  LayoutDashboard, Zap, Target, Calendar, CheckSquare,
+  Zap, Target, Calendar, CheckSquare,
   Plus, X, Trash2, TrendingUp, TrendingDown, Trophy,
   CheckCircle2, Circle, Minus, ChevronDown, Settings,
   Building2, Pencil, ChevronLeft, ChevronRight, Star,
   LogOut, Lock, Mail, Eye, EyeOff, Award, Flame, RefreshCw,
   Wallet, ShieldCheck, Users, Plug, AlertCircle, Info,
-  FileDown, ChevronUp, History, Mic
+  FileDown, ChevronUp, History, Sun
 } from "lucide-react";
 import { api, supabase, SUPABASE_CONFIGURED, DEFAULT_SETTINGS, canAccess, getDaysLeft, type AppEntityName, type Asset, type AssetType, type IntegrationConfig } from "../lib/supabase";
 import { buildExpenseReportPdf } from "./reportPdf";
-import QuickRecordPage from "../pages/QuickRecordPage";
+import { goalProgressOf, pickDailyPriorities, nextRecommendedAction, overdueTasks, pendingHabitsToday, habitCountOn, aggregateProgress } from "../lib/core";
 import {
   AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer,
   RadarChart, Radar, PolarGrid, PolarAngleAxis,
@@ -25,7 +25,10 @@ type GoalStatus = "active" | "in-progress" | "completed";
 type GoalKind = "money" | "habit" | "task";
 type GoalCategory = "salud_y_cuerpo" | "carrera_y_trabajo" | "dinero" | "relaciones" | "deseos_personales";
 type TaskRecurringType = "none" | "daily" | "weekly" | "monthly" | "annual";
-type AppTab = "dashboard" | "money" | "capital" | "plan" | "tasks" | "crm" | "logros" | "activos" | "admin" | "quick";
+// Goal Assistant 90 — áreas principales de la app.
+// Los datos financieros históricos de Momentum 90 no desaparecen: se conservan
+// íntegros y se accede a ellos desde el área secundaria "Registro financiero".
+type AppTab = "hoy" | "metas" | "plan" | "habitos" | "tareas" | "logros" | "oportunidades" | "finanzas" | "activos" | "admin";
 type HabitCategory = "salud" | "negocio" | "enfoque";
 type ObjType = "monetary" | "task" | "habit" | "metric" | "relationship" | "other";
 type BusinessStatus = "idea" | "revision" | "por-publicar" | "marketing" | "ventas" | "negociacion" | "requerimiento" | "proceso";
@@ -810,8 +813,8 @@ function AuthScreen() {
           <div className="w-16 h-16 rounded-2xl bg-gradient-to-br from-[#9D4EDD] to-[#7B2CBF] flex items-center justify-center mx-auto mb-4 shadow-lg shadow-[#9D4EDD]/30">
             <Zap size={28} className="text-white" />
           </div>
-          <h1 className="text-2xl font-black text-white">Momentum <span className="text-[#9D4EDD]">90</span></h1>
-          <p className="text-gray-500 text-sm mt-1">Centro de control financiero personal</p>
+          <h1 className="text-2xl font-black text-white">Goal Assistant <span className="text-[#9D4EDD]">90</span></h1>
+          <p className="text-gray-500 text-sm mt-1">Metas, hábitos y ejecución personal</p>
         </div>
 
         <div className="flex bg-[#16161F] border border-white/5 rounded-2xl p-1 mb-5">
@@ -863,7 +866,7 @@ function AuthScreen() {
         </div>
 
         {mode === "signup" && <p className="text-center text-xs text-gray-700 mt-4">14 días gratis · $14.99 USD/mes después</p>}
-        <p className="text-center text-xs text-gray-800 mt-3">Momentum 90 · v3.0</p>
+        <p className="text-center text-xs text-gray-800 mt-3">Goal Assistant 90 · v3.0</p>
       </div>
     </div>
   );
@@ -1051,6 +1054,247 @@ function HabitTracker({ s, set }: { s: AppState; set: (x: AppState) => void }) {
         </div>
       </Card>
     </>
+  );
+}
+
+// ─── Hoy Tab (Goal Assistant 90 · pantalla inicial de ejecución personal) ────
+
+function HoyTab({ s, set, onGoTo }: { s: AppState; set: (x: AppState) => void; onGoTo: (t: AppTab) => void }) {
+  const todayStr = todayLocal();
+  const q = getQ(); const qYear = getQYear(); const qTotal = getQTotalDays(q, qYear); const dInQ = dayOfQNow();
+  const wIdx = curWeekIndex(qStartDate(q, qYear)) + 1;
+  const qMo: Record<number, string> = { 1: "Ene–Mar", 2: "Abr–Jun", 3: "Jul–Sep", 4: "Oct–Dic" };
+  const dateLabel = new Date().toLocaleDateString("es-MX", { weekday: "long", day: "numeric", month: "long" });
+
+  // Progreso de una meta (monetaria con target → avance real; si no, manual).
+  const goalPctOf = (g: Goal) => goalProgressOf(g.kind, g.targetAmount, g.currentAmount, g.progress);
+
+  // ── Progreso general (promedio de metas activas, plan y hábitos) ──────────
+  const activeGoals = s.goals.filter(g => g.status !== "completed");
+  const parts: { x: number; y: number }[] = [];
+  if (activeGoals.length) parts.push({ x: activeGoals.reduce((a, g) => a + goalPctOf(g), 0), y: activeGoals.length * 100 });
+  const plannedWeeks = s.planWeeks.filter(w => w.objectives.length > 0);
+  if (plannedWeeks.length) parts.push({ x: plannedWeeks.reduce((a, w) => a + w.objectives.filter(o => o.completed).length, 0), y: plannedWeeks.reduce((a, w) => a + w.objectives.length, 0) });
+  const hq = habitQuarter(s);
+  if (hq.y > 0) parts.push({ x: hq.x, y: hq.y });
+  const overallScore = aggregateProgress(parts);
+  const hasRealData = parts.length > 0;
+
+  // ── Prioridades del día (hasta 3): tareas clave primero, luego con fecha ──
+  const topPriorities = pickDailyPriorities(s.tasks, 3);
+  const nextAction = nextRecommendedAction(s.tasks);
+
+  // ── Hábitos pendientes HOY (día local) ─────────────────────────────────────
+  const activeHabits = s.habitConfigs.filter(h => h.active);
+  const pendingHabits = pendingHabitsToday(s.habitConfigs, s.habitLogs, todayStr);
+  const registerHabit = (hid: string) => {
+    const h = s.habitConfigs.find(x => x.id === hid);
+    if (!h) return;
+    const cur = habitCountOn(s.habitLogs, hid, todayStr);
+    if (cur >= h.maxPerDay) return;
+    set({ ...s, habitLogs: setHabitDayLog(s.habitLogs, hid, todayStr, cur + 1) });
+  };
+
+  // ── Meta principal (la de mayor prioridad / menor avance) ─────────────────
+  const prioRank = (g: Goal) => (g.priority === "alta" ? 0 : g.priority === "baja" ? 2 : 1);
+  const mainGoal = activeGoals.slice().sort((a, b) => prioRank(a) - prioRank(b) || goalPctOf(b) - goalPctOf(a))[0] ?? null;
+
+  // ── Alertas de tareas atrasadas ────────────────────────────────────────────
+  const overdue = overdueTasks(s.tasks, todayStr);
+
+  // ── Resumen de avances recientes (últimos 7 días) ─────────────────────────
+  const w7 = new Date(); w7.setDate(w7.getDate() - 7);
+  const pad2 = (x: number) => String(x).padStart(2, "0");
+  const w7Str = `${w7.getFullYear()}-${pad2(w7.getMonth() + 1)}-${pad2(w7.getDate())}`;
+  const recent: { id: string; text: string; date: string; emoji: string }[] = [
+    ...s.miniVictories.filter(m => m.date >= w7Str).map(m => ({ id: "mv_" + m.id, text: m.text, date: m.date, emoji: m.emoji })),
+    ...s.tasks.filter(t => t.isKey && t.completed && t.completedAt && t.completedAt >= w7Str).map(t => ({ id: "tk_" + t.id, text: t.text, date: t.completedAt!, emoji: "✅" })),
+    ...s.goals.filter(g => g.status === "completed" && g.completedAt && g.completedAt.slice(0, 10) >= w7Str).map(g => ({ id: "gl_" + g.id, text: g.title, date: g.completedAt!.slice(0, 10), emoji: "🏆" })),
+  ].sort((a, b) => b.date.localeCompare(a.date)).slice(0, 6);
+  const completeTask = (id: string) => set({ ...s, tasks: s.tasks.map(t => (t.id === id ? { ...t, completed: true, completedAt: todayStr } : t)) });
+
+  return (
+    <div className="space-y-5">
+      {/* Fecha y ciclo actual */}
+      <div className="bg-gradient-to-br from-[#9D4EDD]/15 via-[#16161F] to-[#3B82F6]/10 border border-white/5 rounded-2xl p-5">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div className="min-w-0">
+            <p className="text-xs text-gray-500 uppercase tracking-wider mb-1">Hoy</p>
+            <p className="text-2xl font-black text-white capitalize">{cap(dateLabel)}</p>
+            <div className="flex flex-wrap items-center gap-2 mt-2 text-xs">
+              <span className="bg-[#9D4EDD]/15 border border-[#9D4EDD]/30 text-[#c084fc] px-3 py-1 rounded-full font-medium">Q{q} {qYear} · {qMo[q]}</span>
+              <span className="bg-white/5 border border-white/10 text-gray-400 px-3 py-1 rounded-full font-mono font-bold">Día {dInQ}/{qTotal}</span>
+              <span className="bg-white/5 border border-white/10 text-gray-400 px-3 py-1 rounded-full">Semana {wIdx} de 12</span>
+            </div>
+          </div>
+          <div className="text-right shrink-0">
+            <p className="text-4xl font-black text-[#c084fc]">{hasRealData ? overallScore : "—"}</p>
+            <p className="text-[11px] text-gray-500 mt-0.5">progreso general</p>
+          </div>
+        </div>
+        {hasRealData ? (
+          <div className="mt-4"><BarFill value={overallScore} max={100} h={8} color="#9D4EDD" /><div className="flex justify-between mt-1 text-[10px] text-gray-600"><span>{activeGoals.length} metas activas · {plannedWeeks.length} semanas con objetivos · hábitos {hq.x}/{hq.y} pts</span><span>ciclo Q{q}</span></div></div>
+        ) : (
+          <p className="text-xs text-gray-400 mt-4">Aún no hay datos de progreso. Define tu primera <button onClick={() => onGoTo("metas")} className="text-[#c084fc] hover:underline font-medium">meta →</button>, un <button onClick={() => onGoTo("tareas")} className="text-[#c084fc] hover:underline font-medium">plan de tareas →</button> o revisa tus <button onClick={() => onGoTo("habitos")} className="text-[#c084fc] hover:underline font-medium">hábitos →</button>.</p>
+        )}
+      </div>
+
+      {/* Próxima acción recomendada */}
+      {nextAction ? (
+        <Card className="border-[#9D4EDD]/25 bg-gradient-to-r from-[#9D4EDD]/8 to-transparent">
+          <div className="flex items-start gap-3">
+            <div className="w-10 h-10 rounded-xl bg-[#9D4EDD]/20 flex items-center justify-center shrink-0"><CheckCircle2 size={18} className="text-[#c084fc]" /></div>
+            <div className="flex-1 min-w-0">
+              <p className="text-xs text-[#c084fc] uppercase tracking-wider mb-1">Próxima acción recomendada</p>
+              <p className="text-sm font-semibold text-white">{nextAction.isKey && <span className="mr-1">⭐</span>}{nextAction.text}</p>
+              <p className="text-[11px] text-gray-500 mt-0.5">{nextAction.dueDate ? `Fecha: ${nextAction.dueDate}` : "Sin fecha límite"} · {nextAction.isKey ? "Tarea clave" : "Tarea pendiente"}</p>
+            </div>
+            <button onClick={() => completeTask(nextAction.id)} className="shrink-0 px-4 py-2 bg-[#9D4EDD] text-white rounded-xl text-sm font-medium hover:bg-[#7B2CBF]">✓ Hacer ahora</button>
+          </div>
+        </Card>
+      ) : s.tasks.length > 0 ? (
+        <Card><p className="text-sm text-gray-400 text-center py-2">🎉 No hay tareas pendientes. <button onClick={() => onGoTo("tareas")} className="text-[#c084fc] hover:underline">Ver tareas →</button></p></Card>
+      ) : (
+        <Card><p className="text-sm text-gray-400 text-center py-2">Agrega tareas para obtener una próxima acción recomendada. <button onClick={() => onGoTo("tareas")} className="text-[#c084fc] hover:underline">Crear tarea →</button></p></Card>
+      )}
+
+      {/* Tres prioridades del día */}
+      <Card>
+        <div className="flex items-center justify-between mb-3">
+          <p className="text-xs text-gray-500 uppercase tracking-wider">🎯 Tres prioridades del día</p>
+          {topPriorities.length > 0 && <button onClick={() => onGoTo("tareas")} className="text-[11px] text-[#c084fc] hover:underline">Ver todas</button>}
+        </div>
+        {topPriorities.length === 0 ? (
+          <div className="text-center py-6 text-gray-600">
+            <p className="text-sm">Sin prioridades pendientes hoy.</p>
+            <button onClick={() => onGoTo("tareas")} className="mt-3 inline-flex items-center gap-1.5 px-4 py-2 bg-[#9D4EDD]/15 border border-[#9D4EDD]/30 text-[#c084fc] rounded-xl text-sm font-medium hover:bg-[#9D4EDD]/25"><Plus size={14} /> Definir tarea clave</button>
+          </div>
+        ) : (
+          <div className="space-y-2">
+            {topPriorities.map((t, i) => (
+              <div key={t.id} className="flex items-center gap-3 rounded-xl bg-[#0D0D12] border border-white/5 p-3">
+                <span className={`w-6 h-6 rounded-full flex items-center justify-center text-[11px] font-black shrink-0 ${i === 0 ? "bg-[#9D4EDD] text-white" : i === 1 ? "bg-[#9D4EDD]/60 text-white" : "bg-white/10 text-gray-300"}`}>{i + 1}</span>
+                <div className="flex-1 min-w-0">
+                  <p className="text-sm text-gray-200 truncate">{t.isKey && <span className="mr-1">⭐</span>}{t.text}</p>
+                  <p className="text-[11px] text-gray-600">{t.dueDate ? `📅 ${t.dueDate}` : "sin fecha"}{t.dueDate && t.dueDate < todayStr ? " · atrasada" : ""}</p>
+                </div>
+                <button onClick={() => completeTask(t.id)} aria-label={`Completar ${t.text}`} className="w-7 h-7 rounded-lg bg-emerald-500/15 border border-emerald-500/30 text-emerald-400 hover:bg-emerald-500/25 flex items-center justify-center shrink-0"><CheckCircle2 size={14} /></button>
+              </div>
+            ))}
+          </div>
+        )}
+      </Card>
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        {/* Hábitos pendientes hoy */}
+        <Card>
+          <div className="flex items-center justify-between mb-3">
+            <p className="text-xs text-gray-500 uppercase tracking-wider">Hábitos pendientes hoy</p>
+            {pendingHabits.length > 0 && <button onClick={() => onGoTo("habitos")} className="text-[11px] text-[#c084fc] hover:underline">Ver semana</button>}
+          </div>
+          {pendingHabits.length === 0 ? (
+            <div className="text-center py-6 text-gray-600">
+              <Flame size={22} className="mx-auto mb-2 opacity-30" />
+              <p className="text-sm">{activeHabits.length === 0 ? "No tienes hábitos activos." : "🎉 ¡Hábitos del día completados!"}</p>
+              <button onClick={() => onGoTo("habitos")} className="mt-3 text-xs text-[#c084fc] hover:underline">Ir a Hábitos →</button>
+            </div>
+          ) : (
+            <div className="space-y-2">
+              {pendingHabits.slice(0, 5).map(h => {
+                const cur = habitCountOn(s.habitLogs, h.id, todayStr);
+                return (
+                  <div key={h.id} className="flex items-center gap-3 rounded-xl bg-[#0D0D12] border border-white/5 p-2.5">
+                    <span className="text-xl">{h.emoji}</span>
+                    <div className="flex-1 min-w-0"><p className="text-sm text-gray-200 truncate">{h.name}</p><p className="text-[11px] text-gray-600">{cur}/{h.maxPerDay} hoy</p></div>
+                    <button onClick={() => registerHabit(h.id)} disabled={cur >= h.maxPerDay} className="px-3 py-1.5 rounded-xl text-xs font-medium bg-[#9D4EDD]/15 border border-[#9D4EDD]/30 text-[#c084fc] hover:bg-[#9D4EDD]/25 disabled:opacity-40">Registrar</button>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </Card>
+
+        {/* Meta principal */}
+        <Card>
+          <div className="flex items-center justify-between mb-3">
+            <p className="text-xs text-gray-500 uppercase tracking-wider">Meta principal</p>
+            {activeGoals.length > 1 && <button onClick={() => onGoTo("metas")} className="text-[11px] text-[#c084fc] hover:underline">Ver todas</button>}
+          </div>
+          {mainGoal ? (
+            <div>
+              <div className="flex items-start justify-between gap-2 mb-2">
+                <p className="text-sm font-semibold text-white leading-snug">{mainGoal.title}</p>
+                <Bdg color={mainGoal.status === "completed" ? "green" : goalPctOf(mainGoal) >= 70 ? "purple" : "yellow"}>{goalPctOf(mainGoal)}%</Bdg>
+              </div>
+              <BarFill value={goalPctOf(mainGoal)} max={100} h={7} color={mainGoal.status === "completed" ? "#10B981" : "#9D4EDD"} />
+              <p className="text-[11px] text-gray-600 mt-2">
+                {mainGoal.type === "annual" ? "Meta anual" : "Meta trimestral"} · {mainGoal.kind === "money" ? "💰 monetaria" : mainGoal.kind === "habit" ? "🔄 hábito" : "✅ resultado"}
+                {mainGoal.dueDate ? ` · vence ${mainGoal.dueDate}` : ""}
+              </p>
+              {mainGoal.kind === "money" && mainGoal.targetAmount ? <p className="text-xs text-gray-400 mt-1">{fmtExact(mainGoal.currentAmount ?? 0, s.currency)} de {fmtExact(mainGoal.targetAmount, s.currency)}</p> : null}
+            </div>
+          ) : (
+            <div className="text-center py-6 text-gray-600">
+              <Target size={22} className="mx-auto mb-2 opacity-30" />
+              <p className="text-sm">Sin metas activas.</p>
+              <button onClick={() => onGoTo("metas")} className="mt-3 text-xs text-[#c084fc] hover:underline">Definir mi meta →</button>
+            </div>
+          )}
+        </Card>
+      </div>
+
+      {/* Alertas de tareas atrasadas */}
+      {overdue.length > 0 && (
+        <div className="rounded-2xl border border-red-500/25 bg-red-500/8 p-4 flex items-start gap-3">
+          <AlertCircle size={18} className="text-red-400 mt-0.5 shrink-0" />
+          <div className="flex-1 min-w-0">
+            <p className="text-sm font-semibold text-red-300">Tienes {overdue.length} tarea{overdue.length > 1 ? "s" : ""} atrasada{overdue.length > 1 ? "s" : ""}</p>
+            <p className="text-xs text-red-200/60 mt-0.5 truncate">{overdue.slice(0, 2).map(t => t.text).join(" · ")}{overdue.length > 2 ? "…" : ""}</p>
+          </div>
+          <button onClick={() => onGoTo("tareas")} className="shrink-0 px-3 py-1.5 rounded-xl text-xs font-medium bg-red-500/15 border border-red-500/30 text-red-300 hover:bg-red-500/25">Revisar</button>
+        </div>
+      )}
+
+      {/* Resumen de avances recientes */}
+      <Card>
+        <p className="text-xs text-gray-500 uppercase tracking-wider mb-3">Avances recientes · últimos 7 días</p>
+        {recent.length === 0 ? (
+          <p className="text-sm text-gray-600 text-center py-6">Aún no hay avances esta semana. Cada tarea clave, meta o mini victoria que completes aparecerá aquí. <button onClick={() => onGoTo("logros")} className="text-[#c084fc] hover:underline">Ver historial →</button></p>
+        ) : (
+          <div className="space-y-1.5">
+            {recent.map(r => (
+              <div key={r.id} className="flex items-center gap-3 rounded-xl bg-[#0D0D12] border border-white/5 px-3 py-2">
+                <span className="text-base">{r.emoji}</span>
+                <p className="flex-1 min-w-0 text-sm text-gray-300 truncate">{r.text}</p>
+                <span className="text-[11px] text-gray-600 shrink-0">{r.date}</span>
+              </div>
+            ))}
+          </div>
+        )}
+      </Card>
+    </div>
+  );
+}
+
+// ─── Hábitos Tab (Goal Assistant 90) ─────────────────────────────────────────
+
+function HabitosTab({ s, set }: { s: AppState; set: (x: AppState) => void }) {
+  const active = s.habitConfigs.filter(h => h.active).length;
+  return (
+    <div className="space-y-5">
+      {active === 0 && (
+        <Card>
+          <div className="flex items-center gap-3">
+            <div className="w-11 h-11 rounded-2xl bg-[#9D4EDD]/15 flex items-center justify-center text-xl shrink-0">🔄</div>
+            <div>
+              <p className="text-sm font-semibold text-white">No tienes hábitos activos</p>
+              <p className="text-xs text-gray-500 mt-0.5">Usa el engranaje ⚙️ de la esquina superior derecha del seguimiento semanal para activar o crear hábitos.</p>
+            </div>
+          </div>
+        </Card>
+      )}
+      <HabitTracker s={s} set={set} />
+    </div>
   );
 }
 
@@ -3607,7 +3851,7 @@ function AdminDashboard({ accessToken, profile }: { accessToken?: string; profil
 
 // ─── App Root ─────────────────────────────────────────────────────────────────
 
-const SK = "momentum90_v1";
+const SK = "momentum90_v1"; // clave legacy de localStorage (se conserva para migrar datos históricos)
 
 const ENTITY_PERSISTENCE: { entity: AppEntityName; key: keyof AppState }[] = [
   { entity: "incomes", key: "incomes" },
@@ -3700,7 +3944,7 @@ function AccessBlockedScreen({ state, end, reason, onRetry }: {
         <p className="text-white font-semibold text-lg">{title}</p>
         <p className="text-gray-500 text-sm">{detail}</p>
         {expired && (
-          <a href="mailto:octaface@gmail.com?subject=Trial%20Momentum90" className="inline-block rounded-xl bg-[#9D4EDD] hover:bg-[#7B2CBF] text-white text-sm font-semibold px-5 py-2.5 transition-all">Contactar al administrador</a>
+          <a href="mailto:octaface@gmail.com?subject=Trial%20Goal%20Assistant%2090" className="inline-block rounded-xl bg-[#9D4EDD] hover:bg-[#7B2CBF] text-white text-sm font-semibold px-5 py-2.5 transition-all">Contactar al administrador</a>
         )}
         {!expired && (
           <button onClick={onRetry} className="rounded-xl bg-[#9D4EDD] hover:bg-[#7B2CBF] text-white text-sm font-semibold px-5 py-2.5 transition-all">Reintentar</button>
@@ -3722,18 +3966,11 @@ export default function App() {
   const [profileLoading, setProfileLoading] = useState(true);
   const [authLoading, setAuthLoading] = useState(true);
   const [userEmail, setUserEmail] = useState("");
-  const [tab, setTab] = useState<AppTab>("dashboard");
+  const [tab, setTab] = useState<AppTab>("hoy");
   const [showSettings, setShowSettings] = useState(false);
-  // Botón flotante global de registro rápido por voz (bottom-sheet).
-  const [showQuickModal, setShowQuickModal] = useState(false);
   // Aviso "Actualizar app" (detección de versión sin service worker; global para todos los usuarios).
   const [updateDismissed, setUpdateDismissed] = useState(false);
   const newVersionAvailable = useNewAppVersion(!!session && !updateDismissed);
-  // Bloquea el scroll del body mientras el bottom-sheet de voz está abierto.
-  useEffect(() => {
-    document.body.style.overflow = showQuickModal ? "hidden" : "";
-    return () => { document.body.style.overflow = ""; };
-  }, [showQuickModal]);
   // Auto-centra el tab activo en la navegación inferior (móvil) para que CRM,
   // Logros, etc. sean siempre alcanzables con scroll horizontal.
   useEffect(() => {
@@ -4050,56 +4287,6 @@ export default function App() {
     }
   }
 
-  // Mutación verificada de gastos (Registro por voz): escribe en user_entities y
-  // SOLO si Supabase responde OK se refleja en la interfaz.
-  async function mutateExpenses(updater: (prev: Expense[]) => Expense[]): Promise<boolean> {
-    const s = sessionRef.current;
-    if (!s?.access_token) { setSaveError("No hay una sesión válida."); return false; }
-    if (!loadedRef.current) { setSaveError("Tus datos aún no se han cargado. Inténtalo en un momento."); return false; }
-    const prev = Array.isArray(dataRef.current.expenses) ? dataRef.current.expenses : [];
-    const next = updater(prev);
-    try {
-      await api.saveEntity(s.access_token, "expenses", next);
-      setData({ ...dataRef.current, expenses: next });
-      setSaveError(null);
-      return true;
-    } catch (e) {
-      console.error("[SAVE_EXPENSE_ERROR]", e);
-      setSaveError("No se pudo guardar el gasto. Revisa tu conexión e inténtalo de nuevo.");
-      return false;
-    }
-  }
-
-  // Abono verificado a una deuda existente (Registro por voz): registra en el
-  // historial (auditable) y recalcula saldo/estado sin borrar nada.
-  async function mutateDebtPayment(debtId: string, amount: number, date: string, note?: string): Promise<boolean> {
-    const s = sessionRef.current;
-    if (!s?.access_token) { setSaveError("No hay una sesión válida."); return false; }
-    if (!loadedRef.current) { setSaveError("Tus datos aún no se han cargado. Inténtalo en un momento."); return false; }
-    const prev = Array.isArray(dataRef.current.debts) ? dataRef.current.debts : [];
-    const next = prev.map(d => {
-      if (d.id !== debtId) return d;
-      const prevPaid = debtPaid(d);
-      const base = d.payments && d.payments.length > 0
-        ? d.payments
-        : (prevPaid > 0 ? [{ id: uid(), date: today(), amount: prevPaid, note: "Acumulado previo (migración)" } as DebtPayment] : []);
-      const newHist = [...base, { id: uid(), date, amount, note: note || "Abono por voz" }];
-      const newCur = newHist.filter(p => !p.voided).reduce((a, p) => a + (Number(p.amount) || 0), 0);
-      return recomputeDebt({ ...d, payments: newHist, amountPaid: newCur });
-    });
-    if (!validateDebts(next)) { setSaveError("Datos de deuda inválidos. No se guardó nada."); return false; }
-    try {
-      await api.saveEntity(s.access_token, "debts", next);
-      setData({ ...dataRef.current, debts: next });
-      setSaveError(null);
-      return true;
-    } catch (e) {
-      console.error("[SAVE_DEBT_PAYMENT_ERROR]", e);
-      setSaveError("No se pudo guardar el abono. Revisa tu conexión e inténtalo de nuevo.");
-      return false;
-    }
-  }
-
   // Detecta cambios reales (diff contra el último estado conocido en la nube) y agenda el guardado.
   useEffect(() => {
     if (!loadedRef.current) return;               // A1/A3: nada de guardado antes de LOAD
@@ -4194,7 +4381,7 @@ export default function App() {
         <div className="w-12 h-12 rounded-xl bg-gradient-to-br from-[#9D4EDD] to-[#7B2CBF] flex items-center justify-center mx-auto mb-4 animate-pulse">
           <Zap size={22} className="text-white" />
         </div>
-        <p className="text-gray-500 text-sm">Cargando Momentum 90…</p>
+        <p className="text-gray-500 text-sm">Cargando Goal Assistant 90…</p>
       </div>
     </div>
   );
@@ -4263,17 +4450,28 @@ export default function App() {
   const hotProps = (data.businesses || []).filter(b => b.status === "marketing" || b.status === "ventas").length + (data.contacts || []).filter(c => c.status === "cita" || c.status === "apartado" || c.status === "cierre").length;
   const completedGoals = data.goals.filter(g => g.status === "completed").length;
 
-  const TABS: { id: AppTab; label: string; short: string; icon: ReactNode; badge?: number }[] = [
-    { id: "dashboard", label: "Dashboard CEO", short: "CEO", icon: <LayoutDashboard size={16} /> },
-    { id: "money", label: "Motor de Dinero", short: "Dinero", icon: <Zap size={16} /> },
-    { id: "capital", label: "Capital & Metas", short: "Capital", icon: <Target size={16} /> },
-    { id: "activos", label: "Activos", short: "Activos", icon: <Wallet size={16} /> },
-    { id: "plan", label: "Plan Trimestral", short: "Plan", icon: <Calendar size={16} /> },
-    { id: "tasks", label: "Tareas", short: "Tareas", icon: <CheckSquare size={16} />, badge: keyDone < 3 ? keyDone : undefined },
-    { id: "crm", label: "CRM", short: "CRM", icon: <Building2 size={16} />, badge: hotProps || undefined },
-    { id: "logros", label: "Logros & Victorias", short: "Logros", icon: <Trophy size={16} />, badge: completedGoals || undefined },
-    ...(profile?.role === "admin" ? [{ id: "admin" as AppTab, label: "Admin", short: "Admin", icon: <ShieldCheck size={16} /> }] : []),
+  // Goal Assistant 90 — áreas principales (la pantalla inicial es "Hoy").
+  // Los módulos financieros históricos de Momentum 90 NO son áreas principales:
+  // se conservan bajo "Registro financiero · Momentum 90 (referencia)" para no
+  // duplicar contabilidad ni perder datos.
+  interface TabDef { id: AppTab; label: string; short: string; icon: ReactNode; badge?: number; group?: "main" | "fin"; }
+
+  const MAIN_TABS: TabDef[] = [
+    { id: "hoy", label: "Hoy", short: "Hoy", icon: <Sun size={16} /> },
+    { id: "metas", label: "Metas", short: "Metas", icon: <Target size={16} /> },
+    { id: "plan", label: "Plan 90/120", short: "Plan", icon: <Calendar size={16} /> },
+    { id: "habitos", label: "Hábitos", short: "Hábitos", icon: <Flame size={16} /> },
+    { id: "tareas", label: "Tareas", short: "Tareas", icon: <CheckSquare size={16} />, badge: keyDone < 3 ? keyDone : undefined },
+    { id: "logros", label: "Logros", short: "Logros", icon: <Trophy size={16} />, badge: completedGoals || undefined },
+    { id: "oportunidades", label: "Oportunidades", short: "Oport.", icon: <Building2 size={16} />, badge: hotProps || undefined },
   ];
+  // Referencia financiera Momentum 90 (datos conservados, no es un módulo principal).
+  const FIN_TABS: TabDef[] = [
+    { id: "finanzas", label: "Registro financiero · Momentum 90", short: "M90", icon: <Zap size={16} /> },
+    { id: "activos", label: "Activos", short: "Activos", icon: <Wallet size={16} /> },
+  ];
+  const ADMIN_TABS: TabDef[] = profile?.role === "admin" ? [{ id: "admin" as AppTab, label: "Admin", short: "Admin", icon: <ShieldCheck size={16} /> }] : [];
+  const activeTabLabel = [...MAIN_TABS, ...FIN_TABS, ...ADMIN_TABS].find(t => t.id === tab)?.label ?? "Hoy";
 
   return (
     <div className="min-h-screen bg-[#0B0B0E] text-white" style={{ fontFamily: "'Inter', sans-serif" }}>
@@ -4301,23 +4499,37 @@ export default function App() {
       )}
 
       {/* Desktop sidebar */}
-      <aside className="hidden lg:flex flex-col fixed top-0 left-0 h-screen w-56 bg-[#0D0D12] border-r border-white/5 z-40 p-4">
-        <div className="flex items-center gap-2.5 mb-8 px-1">
-          <div className="w-8 h-8 rounded-xl bg-gradient-to-br from-[#9D4EDD] to-[#7B2CBF] flex items-center justify-center shrink-0"><Zap size={15} className="text-white" /></div>
-          <div><p className="text-white font-bold text-sm leading-tight">Momentum</p><p className="text-[#9D4EDD] text-xs font-semibold tracking-widest">90</p></div>
+      <aside className="hidden lg:flex flex-col fixed top-0 left-0 h-screen w-64 bg-[#0D0D12] border-r border-white/5 z-40 p-4">
+        <div className="flex items-center gap-2.5 mb-6 px-1">
+          <div className="w-8 h-8 rounded-xl bg-gradient-to-br from-[#9D4EDD] to-[#7B2CBF] flex items-center justify-center shrink-0"><Target size={15} className="text-white" /></div>
+          <div><p className="text-white font-bold text-sm leading-tight">Goal Assistant</p><p className="text-[#9D4EDD] text-xs font-semibold tracking-widest">90</p></div>
         </div>
-        <nav className="flex-1 space-y-1">
-          {TABS.map(t => (
+        <nav className="flex-1 space-y-1 overflow-y-auto">
+          {MAIN_TABS.map(t => (
             <button key={t.id} onClick={() => setTab(t.id)} className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-medium transition-all ${tab === t.id ? "bg-[#9D4EDD]/15 text-[#c084fc] border border-[#9D4EDD]/25" : "text-gray-500 hover:text-gray-200 hover:bg-white/5"}`}>
               {t.icon} {t.label}
               {t.badge !== undefined && <span className="ml-auto text-[10px] bg-amber-500/20 text-amber-400 border border-amber-500/20 px-1.5 py-0.5 rounded-full">{t.badge}</span>}
-              {t.id === "crm" && hotProps > 0 && tab !== "crm" && <span className="ml-auto text-[10px] bg-[#9D4EDD]/20 text-[#c084fc] border border-[#9D4EDD]/20 px-1.5 py-0.5 rounded-full">{hotProps}</span>}
+              {t.id === "oportunidades" && hotProps > 0 && tab !== "oportunidades" && <span className="ml-auto text-[10px] bg-[#9D4EDD]/20 text-[#c084fc] border border-[#9D4EDD]/20 px-1.5 py-0.5 rounded-full">{hotProps}</span>}
+            </button>
+          ))}
+          {ADMIN_TABS.map(t => (
+            <button key={t.id} onClick={() => setTab(t.id)} className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-medium transition-all ${tab === t.id ? "bg-[#9D4EDD]/15 text-[#c084fc] border border-[#9D4EDD]/25" : "text-gray-500 hover:text-gray-200 hover:bg-white/5"}`}>
+              {t.icon} {t.label}
             </button>
           ))}
         </nav>
-        <div className="pt-4 border-t border-white/5 space-y-2">
-          <button onClick={() => setShowSettings(!showSettings)} className="w-full flex items-center gap-2 px-3 py-2 rounded-xl text-gray-600 hover:text-gray-300 hover:bg-white/5 text-xs transition-all"><Settings size={13} /> Configuración</button>
-          <p className="text-[10px] text-gray-700 px-1">Momentum90 · Q{getQ()} {getQYear()} · Día {dayOfQNow()}/{getQTotalDays(getQ(), getQYear())}</p>
+        <div className="pt-4 border-t border-white/5 space-y-1">
+          <p className="text-[9px] uppercase tracking-wider text-gray-700 px-2 mb-1">Datos Momentum 90 · referencia</p>
+          {FIN_TABS.map(t => (
+            <button key={t.id} onClick={() => setTab(t.id)} className={`w-full flex items-center gap-3 px-3 py-2 rounded-xl text-xs font-medium transition-all ${tab === t.id ? "bg-[#9D4EDD]/15 text-[#c084fc] border border-[#9D4EDD]/25" : "text-gray-600 hover:text-gray-300 hover:bg-white/5"}`}>
+              {t.icon} {t.short === "M90" ? "Registro financiero" : t.label}
+              {t.short === "M90" && <span className="ml-auto text-[9px] text-gray-700 border border-white/10 rounded px-1 py-0.5">M90</span>}
+            </button>
+          ))}
+        </div>
+        <div className="pt-3 mt-2 border-t border-white/5 space-y-2">
+          <button onClick={() => setShowSettings(!showSettings)} className="w-full flex items-center gap-2 px-3 py-2 rounded-xl text-gray-500 hover:text-gray-200 hover:bg-white/5 text-sm font-medium transition-all"><Settings size={14} /> Ajustes</button>
+          <p className="text-[10px] text-gray-700 px-1">Goal Assistant 90 · Q{getQ()} {getQYear()} · Día {dayOfQNow()}/{getQTotalDays(getQ(), getQYear())}</p>
         </div>
       </aside>
 
@@ -4325,11 +4537,11 @@ export default function App() {
         <header className="sticky top-0 z-40 bg-[#0B0B0E]/85 backdrop-blur-xl border-b border-white/5">
           <div className="flex items-center justify-between px-5 py-3.5 max-w-6xl mx-auto">
             <div className="lg:hidden flex items-center gap-2.5">
-              <div className="w-7 h-7 rounded-lg bg-gradient-to-br from-[#9D4EDD] to-[#7B2CBF] flex items-center justify-center"><Zap size={13} className="text-white" /></div>
-              <span className="text-white font-bold text-sm">Momentum<span className="text-[#9D4EDD]">90</span></span>
+              <div className="w-7 h-7 rounded-lg bg-gradient-to-br from-[#9D4EDD] to-[#7B2CBF] flex items-center justify-center"><Target size={13} className="text-white" /></div>
+              <span className="text-white font-bold text-sm whitespace-nowrap">Goal Assistant <span className="text-[#9D4EDD]">90</span></span>
             </div>
             <div className="hidden lg:block">
-              <h1 className="text-base font-bold text-white">{TABS.find(t => t.id === tab)?.label}</h1>
+              <h1 className="text-base font-bold text-white">{activeTabLabel}</h1>
               <p className="text-xs text-gray-600">{new Date().toLocaleDateString("es-MX", { weekday: "long", year: "numeric", month: "long", day: "numeric" })}</p>
             </div>
             <div className="flex items-center gap-2">
@@ -4353,71 +4565,61 @@ export default function App() {
               <button onClick={() => setSaveError(null)} className="text-red-400/70 hover:text-red-300 shrink-0" aria-label="Cerrar aviso"><X size={15} /></button>
             </div>
           )}
-          {tab === "dashboard" && <DashboardTab s={data} set={setData} hideAmounts={hideAmounts} onToggleHide={toggleHideAmounts} />}
-          {tab === "money" && <MoneyTab s={data} set={setData} hideAmounts={hideAmounts} onToggleHide={toggleHideAmounts} onMutateIncomes={mutateIncomes} onMutateDebts={mutateDebts} />}
-          {tab === "capital" && <CapitalTab s={data} set={setData} hideAmounts={hideAmounts} onToggleHide={toggleHideAmounts} />}
-          {tab === "activos" && <AssetsTab s={data} set={setData} hideAmounts={hideAmounts} onToggleHide={toggleHideAmounts} />}
+          {tab === "hoy" && <HoyTab s={data} set={setData} onGoTo={(t: AppTab) => setTab(t)} />}
+          {tab === "metas" && <CapitalTab s={data} set={setData} hideAmounts={hideAmounts} onToggleHide={toggleHideAmounts} />}
           {tab === "plan" && <PlanTab s={data} set={setData} />}
-          {tab === "tasks" && <TasksTab s={data} set={setData} />}
-          {tab === "crm" && <CRMTab s={data} set={setData} />}
+          {tab === "habitos" && <HabitosTab s={data} set={setData} />}
+          {tab === "tareas" && <TasksTab s={data} set={setData} />}
           {tab === "logros" && <LogrosTab s={data} set={setData} />}
+          {tab === "oportunidades" && <CRMTab s={data} set={setData} />}
+          {tab === "finanzas" && (
+            <div className="space-y-5">
+              <div className="rounded-2xl border border-[#9D4EDD]/15 bg-[#9D4EDD]/5 p-4 flex items-start gap-3">
+                <Zap size={18} className="text-[#c084fc] mt-0.5 shrink-0" />
+                <div>
+                  <p className="text-sm font-semibold text-white">Registro financiero · Momentum 90 (referencia)</p>
+                  <p className="text-xs text-gray-500 mt-0.5">Datos financieros históricos conservados íntegros. Goal Assistant 90 no crea una segunda contabilidad: este es el registro de origen de Momentum 90.</p>
+                </div>
+              </div>
+              <MoneyTab s={data} set={setData} hideAmounts={hideAmounts} onToggleHide={toggleHideAmounts} onMutateIncomes={mutateIncomes} onMutateDebts={mutateDebts} />
+            </div>
+          )}
+          {tab === "activos" && <AssetsTab s={data} set={setData} hideAmounts={hideAmounts} onToggleHide={toggleHideAmounts} />}
           {tab === "admin" && profile?.role === "admin" && <AdminDashboard accessToken={session?.access_token} profile={profile} />}
         </main>
       </div>
 
-      {/* Mobile bottom nav */}
+      {/* Mobile bottom nav — Goal Assistant 90: áreas principales + Ajustes */}
       <nav className="lg:hidden fixed bottom-0 left-0 right-0 z-50 bg-[#0D0D12]/95 backdrop-blur-xl border-t border-white/5 pb-[env(safe-area-inset-bottom)]">
         <div className="flex items-center overflow-x-auto px-1 py-1.5 gap-1 scrollbar-hide scroll-smooth">
-          {TABS.map(t => (
+          {MAIN_TABS.map(t => (
             <button key={t.id} id={`tab-${t.id}`} onClick={() => setTab(t.id)} className={`flex flex-col items-center gap-0.5 py-1.5 px-3 min-w-[52px] rounded-xl transition-all relative shrink-0 ${tab === t.id ? "text-[#c084fc] bg-[#9D4EDD]/10" : "text-gray-600 hover:text-gray-400"}`}>
               {t.icon}
               <span className="text-[9px] font-medium">{t.short}</span>
-              {t.id === "tasks" && keyDone < 3 && <div className="absolute -top-0.5 -right-0.5 w-3 h-3 bg-amber-400 rounded-full text-[7px] text-black font-black flex items-center justify-center">{keyDone}</div>}
-              {t.id === "crm" && hotProps > 0 && <div className="absolute -top-0.5 -right-0.5 w-3 h-3 bg-[#9D4EDD] rounded-full text-[7px] text-white font-black flex items-center justify-center">{hotProps}</div>}
+              {t.id === "tareas" && keyDone < 3 && <div className="absolute -top-0.5 -right-0.5 w-3 h-3 bg-amber-400 rounded-full text-[7px] text-black font-black flex items-center justify-center">{keyDone}</div>}
+              {t.id === "oportunidades" && hotProps > 0 && <div className="absolute -top-0.5 -right-0.5 w-3 h-3 bg-[#9D4EDD] rounded-full text-[7px] text-white font-black flex items-center justify-center">{hotProps}</div>}
               {t.id === "logros" && completedGoals > 0 && <div className="absolute -top-0.5 -right-0.5 w-3 h-3 bg-emerald-500 rounded-full text-[7px] text-white font-black flex items-center justify-center">{completedGoals}</div>}
             </button>
           ))}
+          {ADMIN_TABS.map(t => (
+            <button key={t.id} id={`tab-${t.id}`} onClick={() => setTab(t.id)} className={`flex flex-col items-center gap-0.5 py-1.5 px-3 min-w-[52px] rounded-xl transition-all relative shrink-0 ${tab === t.id ? "text-[#c084fc] bg-[#9D4EDD]/10" : "text-gray-600 hover:text-gray-400"}`}>
+              {t.icon}
+              <span className="text-[9px] font-medium">{t.short}</span>
+            </button>
+          ))}
+          <div className="w-px h-8 bg-white/10 shrink-0 mx-0.5" aria-hidden="true" />
+          {FIN_TABS.map(t => (
+            <button key={t.id} id={`tab-${t.id}`} onClick={() => setTab(t.id)} className={`flex flex-col items-center gap-0.5 py-1.5 px-3 min-w-[52px] rounded-xl transition-all relative shrink-0 ${tab === t.id ? "text-[#c084fc] bg-[#9D4EDD]/10" : "text-gray-700 hover:text-gray-400"}`} title={t.label}>
+              {t.icon}
+              <span className="text-[9px] font-medium">{t.short}</span>
+            </button>
+          ))}
+          <button onClick={() => setShowSettings(true)} className="flex flex-col items-center gap-0.5 py-1.5 px-3 min-w-[52px] rounded-xl transition-all relative shrink-0 text-gray-600 hover:text-gray-400">
+            <Settings size={16} />
+            <span className="text-[9px] font-medium">Ajustes</span>
+          </button>
         </div>
       </nav>
-
-      {/* Botón flotante global de registro rápido por voz (visible en cualquier pantalla) */}
-      {session && (
-        <>
-          <button
-            onClick={() => setShowQuickModal(true)}
-            aria-label="Registro rápido por voz"
-            className="fixed right-4 z-[65] flex h-14 w-14 items-center justify-center rounded-full bg-[#9D4EDD] text-white shadow-lg shadow-[#9D4EDD]/40 active:scale-95 transition-transform bottom-[calc(env(safe-area-inset-bottom)+5.5rem)] lg:right-6 lg:bottom-6"
-          >
-            <Mic size={22} />
-          </button>
-          {showQuickModal && (
-            <div className="fixed inset-0 z-[80] bg-black/70 flex items-end justify-center" onClick={() => setShowQuickModal(false)}>
-              <div
-                className="w-full max-w-lg bg-[#16161F] rounded-t-2xl border-t border-white/10 flex flex-col overflow-hidden shadow-2xl"
-                onClick={e => e.stopPropagation()}
-                style={{ height: "min(90dvh, 720px)" }}
-              >
-                <div className="flex items-center justify-between px-5 py-4 border-b border-white/5 shrink-0">
-                  <p className="text-white font-bold">Registro rápido por voz</p>
-                  <button onClick={() => setShowQuickModal(false)} className="w-9 h-9 flex items-center justify-center text-gray-500 hover:text-white rounded-xl" aria-label="Cerrar registro rápido"><X size={18} /></button>
-                </div>
-                <div className="flex-1 overflow-y-auto overscroll-contain px-4 py-4 pb-[calc(1.5rem+env(safe-area-inset-bottom))]">
-                  <QuickRecordPage
-                    data={data}
-                    accessToken={session?.access_token}
-                    embedded
-                    onMutateIncomes={mutateIncomes}
-                    onMutateExpenses={mutateExpenses}
-                    onMutateDebts={mutateDebts}
-                    onMutateDebtPayment={mutateDebtPayment}
-                    onGoTo={t => { setShowQuickModal(false); setTab(t as AppTab); }}
-                  />
-                </div>
-              </div>
-            </div>
-          )}
-        </>
-      )}
     </div>
   );
 }

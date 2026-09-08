@@ -1,5 +1,5 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// Reporte PDF de Gastos — Momentum90
+// Reporte PDF de Gastos — Goal Assistant 90
 // Generación 100% en el navegador con jsPDF (sin subir archivos, sin Storage,
 // sin carpeta pública de Netlify). Solo se usa la información del usuario
 // autenticado que llama a la función. Descarga directa del archivo.
@@ -114,7 +114,7 @@ export function buildExpenseReportPdf(input: ExpenseReportInput): ExpenseReportR
   doc.setFont("helvetica", "bold");
   doc.setFontSize(16);
   doc.setTextColor(15, 15, 20);
-  doc.text("Reporte de Gastos — Momentum90", 14, y);
+  doc.text("Reporte de Gastos — Goal Assistant 90", 14, y);
   y += 7;
   doc.setFont("helvetica", "normal");
   doc.setFontSize(10);
@@ -210,7 +210,7 @@ export function buildExpenseReportPdf(input: ExpenseReportInput): ExpenseReportR
     doc.setPage(p);
     doc.setFontSize(8);
     doc.setTextColor(160, 160, 165);
-    doc.text(`Momentum90 · Reporte de gastos generado localmente · ${new Date().toISOString().slice(0, 10)}`, 14, pageH - 10);
+    doc.text(`Goal Assistant 90 · Reporte de gastos generado localmente · ${new Date().toISOString().slice(0, 10)}`, 14, pageH - 10);
     doc.text(`Página ${p} de ${nPages}`, pageW - 14, pageH - 10, { align: "right" });
   }
 
