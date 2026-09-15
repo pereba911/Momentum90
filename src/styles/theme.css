@@ -180,7 +180,7 @@
   }
 }
 
-/* ─── Goal Assistant 90 · celebración y avisos (CSS puro, sin librerías) ───── */
+/* ─── Goal Assist 90 · celebración y avisos (CSS puro, sin librerías) ───── */
 @keyframes gaCelebrate {
   0%   { opacity: 0; }
   12%  { opacity: 1; }

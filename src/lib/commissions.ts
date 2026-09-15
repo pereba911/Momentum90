@@ -1,5 +1,5 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// Goal Assistant 90 · Metas del Mes/Trimestre + Comisiones con abonos parciales
+// Goal Assist 90 · Metas del Mes/Trimestre + Comisiones con abonos parciales
 // -----------------------------------------------------------------------------
 // Módulo PURO (sin React ni Supabase): fuente de verdad para
 //   * el progreso de la meta del mes (🌙) y del trimestre (📅),

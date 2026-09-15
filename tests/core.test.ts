@@ -1,5 +1,5 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// Goal Assistant 90 · Tests de lógica pura (progreso de metas, hábitos,
+// Goal Assist 90 · Tests de lógica pura (progreso de metas, hábitos,
 // prioridades diarias, tareas atrasadas y preservación de datos).
 // Importan src/lib/core (misma lógica que usa la vista "Hoy").
 // ─────────────────────────────────────────────────────────────────────────────

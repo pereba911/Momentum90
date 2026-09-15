@@ -1,5 +1,5 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// Goal Assistant 90 · Metas del mes/trimestre y comisiones con abonos parciales
+// Goal Assist 90 · Metas del mes/trimestre y comisiones con abonos parciales
 //  - Matemática de períodos (mes y trimestre) sin riesgos de zona horaria.
 //  - Regla de negocio central: SOLO las comisiones TOTALMENTE liquidadas suman.
 //  - Bandas de color/emoji/mensaje del progreso.

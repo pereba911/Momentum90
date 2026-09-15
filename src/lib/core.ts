@@ -1,5 +1,5 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// Goal Assistant 90 · utilidades PURAS de progreso y foco diario
+// Goal Assist 90 · utilidades PURAS de progreso y foco diario
 // -----------------------------------------------------------------------------
 // Este módulo NO depende de React ni de Supabase: es la fuente de verdad para
 // calcular progreso de metas, prioridades del día, hábitos pendientes, tareas

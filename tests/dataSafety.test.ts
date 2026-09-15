@@ -1,8 +1,8 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// Goal Assistant 90 · Tests de integridad y seguridad de datos
+// Goal Assist 90 · Tests de integridad y seguridad de datos
 // (análisis estático del repo, sin navegador)
 //  - Ausencia completa de la función de voz.
-//  - Rebranding a "Goal Assistant 90" (HTML, manifest, UI).
+//  - Rebranding a "Goal Assist 90" (HTML, manifest, UI).
 //  - Navegación principal (Hoy/Metas/Plan/Hábitos/Tareas/Logros/Oportunidades)
 //    sin módulos financieros como áreas principales.
 //  - Ausencia de duplicación financiera.
@@ -82,29 +82,62 @@ describe("Ausencia COMPLETA de la función de voz", () => {
   });
 });
 
-describe("Rebranding a Goal Assistant 90", () => {
+describe("Rebranding a Goal Assist 90", () => {
   it("index.html: título, description y apple title", () => {
-    expect(html).toContain("<title>Goal Assistant 90</title>");
-    expect(html).toContain("Goal Assistant 90");
+    expect(html).toContain("<title>Goal Assist 90</title>");
+    expect(html).toContain("Goal Assist 90");
     expect(html).not.toMatch(/<title>Momentum/i);
     expect(html).not.toContain("Centro de control financiero personal");
   });
   it("manifest PWA: nombre de la app instalable", () => {
-    expect(manifest).toContain('"name": "Goal Assistant 90"');
+    expect(manifest).toContain('"name": "Goal Assist 90"');
     expect(manifest).not.toContain("Momentum");
   });
-  it("UI: login, carga, logo y textos ya no usan Momentum 90 como marca visible", () => {
-    expect(app).toContain('Goal Assistant <span className="text-[#9D4EDD]">90</span>');
-    expect(app).toContain("Cargando Goal Assistant 90…");
+  it("UI: login, carga y logo usan la marca Goal Assist 90", () => {
+    expect(app).toContain('Goal Assist <span className="text-[#9D4EDD]">90</span>');
+    expect(app).toContain("Cargando Goal Assist 90…");
+    expect(app).toContain("Goal Assist 90 · v3.0");
     expect(app).not.toContain("Cargando Momentum 90");
     expect(app).not.toContain('<span className="text-white font-bold text-sm">Momentum');
   });
   it("documentación y README reflejan el nuevo producto", () => {
-    expect(read("README.md")).toContain("Goal Assistant 90");
+    expect(read("README.md")).toContain("Goal Assist 90");
+    expect(read("ARCHITECTURE.md")).toContain("Goal Assist 90");
+  });
+  it("los archivos del repo ya no llevan la marca anterior en su nombre", () => {
+    const conMarcaVieja: string[] = [];
+    const revisar = (dir: string) => {
+      for (const name of readdirSync(join(ROOT, dir))) {
+        if (name === "node_modules" || name === ".git" || name === "dist") continue;
+        if (/momentum/i.test(name)) conMarcaVieja.push(join(dir, name));
+        const full = join(ROOT, dir, name);
+        if (statSync(full).isDirectory()) revisar(join(dir, name));
+      }
+    };
+    revisar(".");
+    expect(conMarcaVieja, `archivos con la marca anterior: ${conMarcaVieja.join(", ")}`).toEqual([]);
+  });
+  it("la página de referencia retirada ya no se cita en el bundle de documentos", () => {
+    const documentos = [
+      "README.md",
+      "ARCHITECTURE.md",
+      "ATTRIBUTIONS.md",
+      "guidelines/Guidelines.md",
+      "index.html",
+      "public/manifest.webmanifest",
+    ];
+    for (const doc of documentos) {
+      const content = read(doc);
+      expect(content, `${doc} no debe citar itsmomentum90`).not.toMatch(/itsmomentum90/i);
+      expect(content, `${doc} no debe citar la URL retirada`).not.toMatch(/itsmomentum90\.netlify\.app/i);
+    }
+    for (const file of srcFiles) {
+      expect(readFileSync(join(ROOT, file), "utf8"), `${file} no debe citar la página retirada`).not.toMatch(/itsmomentum90/i);
+    }
   });
 });
 
-describe("Navegación: áreas principales de Goal Assistant 90", () => {
+describe("Navegación: áreas principales de Goal Assist 90", () => {
   it("menú principal = Hoy, Metas, Plan, Hábitos, Tareas, Logros y CRM (sin M90 ni Activos)", () => {
     const mainStart = app.indexOf("const MAIN_TABS: TabDef[] = [");
     const mainEnd = app.indexOf("const ADMIN_TABS: TabDef[] =");

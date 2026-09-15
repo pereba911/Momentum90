@@ -1,6 +1,8 @@
+> Nota de provenance: brief original importado (antes "Momentum120"). Se conserva como referencia de diseño; la contabilidad financiera **no** forma parte de esta app.
+
 Actúa como un arquitecto senior de software, desarrollador full-stack y diseñador de producto, con experiencia en dashboards financieros ejecutivos, apps SaaS, UX para personas con TDAH y sistemas de toma de decisiones bajo presión.
 Tu tarea es diseñar y construir una aplicación web completa, funcional y lista para producción llamada:
-App Name: Momentum120
+App Name: Goal Assist 90
 Este sistema es un centro de control financiero y de ejecución personal enfocado en recuperación, estabilización y expansión financiera, con un ciclo claro de 120 días.
 
 OBJETIVOS CLAVE DEL SISTEMA

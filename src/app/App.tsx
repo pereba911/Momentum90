@@ -39,8 +39,8 @@ type GoalStatus = "active" | "in-progress" | "completed";
 type GoalKind = "money" | "habit" | "task";
 type GoalCategory = "salud_y_cuerpo" | "carrera_y_trabajo" | "dinero" | "relaciones" | "deseos_personales";
 type TaskRecurringType = "none" | "daily" | "weekly" | "monthly" | "annual";
-// Goal Assistant 90 — áreas principales: ejecución personal, sin duplicar la
-// contabilidad de Momentum 90 V2. Los módulos financieros históricos se retiraron de la
+// Goal Assist 90 — áreas principales: ejecución personal, sin duplicar la
+// contabilidad financiera de la app de referencia. Los módulos financieros históricos se retiraron de la
 // interfaz, pero sus datos siguen guardados en Supabase y nunca se borran.
 type AppTab = "hoy" | "metas" | "plan" | "habitos" | "tareas" | "logros" | "oportunidades" | "admin";
 type HabitCategory = "salud" | "negocio" | "enfoque";
@@ -835,7 +835,7 @@ function AuthScreen() {
           <div className="w-16 h-16 rounded-2xl bg-gradient-to-br from-[#9D4EDD] to-[#7B2CBF] flex items-center justify-center mx-auto mb-4 shadow-lg shadow-[#9D4EDD]/30">
             <Zap size={28} className="text-white" />
           </div>
-          <h1 className="text-2xl font-black text-white">Goal Assistant <span className="text-[#9D4EDD]">90</span></h1>
+          <h1 className="text-2xl font-black text-white">Goal Assist <span className="text-[#9D4EDD]">90</span></h1>
           <p className="text-gray-500 text-sm mt-1">Metas, hábitos y ejecución personal</p>
         </div>
 
@@ -888,7 +888,7 @@ function AuthScreen() {
         </div>
 
         {mode === "signup" && <p className="text-center text-xs text-gray-700 mt-4">14 días gratis · $14.99 USD/mes después</p>}
-        <p className="text-center text-xs text-gray-800 mt-3">Goal Assistant 90 · v3.0</p>
+        <p className="text-center text-xs text-gray-800 mt-3">Goal Assist 90 · v3.0</p>
       </div>
     </div>
   );
@@ -1080,7 +1080,7 @@ function HabitTracker({ s, set }: { s: AppState; set: (x: AppState) => void }) {
 }
 
 // ─── Metas del Mes/Trimestre + Comisiones con abonos parciales ────────────────
-// Goal Assistant 90 · dashboard HOY (2 tarjetas de meta) y área Metas (configuración
+// Goal Assist 90 · dashboard HOY (2 tarjetas de meta) y área Metas (configuración
 // de metas + comisiones con abonos parciales).
 // Reglas de datos permanentes:
 //  * SOLO las comisiones TOTALMENTE liquidadas (🟢) suman al progreso de la meta.
@@ -1810,7 +1810,7 @@ function GoalsConfigSection({ s, set, currency, notify, hideAmounts, onToggleHid
   );
 }
 
-// ─── Hoy Tab (Goal Assistant 90 · pantalla inicial de ejecución personal) ────
+// ─── Hoy Tab (Goal Assist 90 · pantalla inicial de ejecución personal) ────
 
 function HoyTab({ s, set, onGoTo }: { s: AppState; set: (x: AppState) => void; onGoTo: (t: AppTab) => void }) {
   const todayStr = todayLocal();
@@ -2081,7 +2081,7 @@ function HoyTab({ s, set, onGoTo }: { s: AppState; set: (x: AppState) => void; o
   );
 }
 
-// ─── Hábitos Tab (Goal Assistant 90) ─────────────────────────────────────────
+// ─── Hábitos Tab (Goal Assist 90) ─────────────────────────────────────────
 
 function HabitosTab({ s, set }: { s: AppState; set: (x: AppState) => void }) {
   const active = s.habitConfigs.filter(h => h.active).length;
@@ -5196,7 +5196,7 @@ export default function App() {
         <div className="w-12 h-12 rounded-xl bg-gradient-to-br from-[#9D4EDD] to-[#7B2CBF] flex items-center justify-center mx-auto mb-4 animate-pulse">
           <Zap size={22} className="text-white" />
         </div>
-        <p className="text-gray-500 text-sm">Cargando Goal Assistant 90…</p>
+        <p className="text-gray-500 text-sm">Cargando Goal Assist 90…</p>
       </div>
     </div>
   );
@@ -5265,8 +5265,8 @@ export default function App() {
   const hotProps = (data.businesses || []).filter(b => b.status === "marketing" || b.status === "ventas").length + (data.contacts || []).filter(c => c.status === "cita" || c.status === "apartado" || c.status === "cierre").length;
   const completedGoals = data.goals.filter(g => g.status === "completed").length;
 
-  // Goal Assistant 90 — áreas principales (la pantalla inicial es "Hoy").
-  // Los módulos financieros históricos de Momentum 90 NO son áreas principales:
+  // Goal Assist 90 — áreas principales (la pantalla inicial es "Hoy").
+  // Los módulos financieros históricos NO son áreas principales:
   // se retiraron de la interfaz para no duplicar la contabilidad de la app de
   // referencia, manteniendo sus datos intactos en Supabase.
   interface TabDef { id: AppTab; label: string; short: string; icon: ReactNode; badge?: number; group?: "main" | "fin"; }
@@ -5312,7 +5312,7 @@ export default function App() {
       <aside className="hidden lg:flex flex-col fixed top-0 left-0 h-screen w-64 bg-[#0D0D12] border-r border-white/5 z-40 p-4">
         <div className="flex items-center gap-2.5 mb-6 px-1">
           <div className="w-8 h-8 rounded-xl bg-gradient-to-br from-[#9D4EDD] to-[#7B2CBF] flex items-center justify-center shrink-0"><Target size={15} className="text-white" /></div>
-          <div><p className="text-white font-bold text-sm leading-tight">Goal Assistant</p><p className="text-[#9D4EDD] text-xs font-semibold tracking-widest">90</p></div>
+          <div><p className="text-white font-bold text-sm leading-tight">Goal Assist</p><p className="text-[#9D4EDD] text-xs font-semibold tracking-widest">90</p></div>
         </div>
         <nav className="flex-1 space-y-1 overflow-y-auto">
           {MAIN_TABS.map(t => (
@@ -5330,7 +5330,7 @@ export default function App() {
         </nav>
         <div className="pt-3 mt-2 border-t border-white/5 space-y-2">
           <button onClick={() => setShowSettings(!showSettings)} className="w-full flex items-center gap-2 px-3 py-2 rounded-xl text-gray-500 hover:text-gray-200 hover:bg-white/5 text-sm font-medium transition-all"><Settings size={14} /> Ajustes</button>
-          <p className="text-[10px] text-gray-700 px-1">Goal Assistant 90 · Q{getQ()} {getQYear()} · Día {dayOfQNow()}/{getQTotalDays(getQ(), getQYear())}</p>
+          <p className="text-[10px] text-gray-700 px-1">Goal Assist 90 · Q{getQ()} {getQYear()} · Día {dayOfQNow()}/{getQTotalDays(getQ(), getQYear())}</p>
         </div>
       </aside>
 
@@ -5339,7 +5339,7 @@ export default function App() {
           <div className="flex items-center justify-between px-5 py-3.5 max-w-6xl mx-auto">
             <div className="lg:hidden flex items-center gap-2.5">
               <div className="w-7 h-7 rounded-lg bg-gradient-to-br from-[#9D4EDD] to-[#7B2CBF] flex items-center justify-center"><Target size={13} className="text-white" /></div>
-              <span className="text-white font-bold text-sm whitespace-nowrap">Goal Assistant <span className="text-[#9D4EDD]">90</span></span>
+              <span className="text-white font-bold text-sm whitespace-nowrap">Goal Assist <span className="text-[#9D4EDD]">90</span></span>
             </div>
             <div className="hidden lg:block">
               <h1 className="text-base font-bold text-white">{activeTabLabel}</h1>
@@ -5377,7 +5377,7 @@ export default function App() {
         </main>
       </div>
 
-      {/* Mobile bottom nav — Goal Assistant 90: áreas principales + Ajustes */}
+      {/* Mobile bottom nav — Goal Assist 90: áreas principales + Ajustes */}
       <nav className="lg:hidden fixed bottom-0 left-0 right-0 z-50 bg-[#0D0D12]/95 backdrop-blur-xl border-t border-white/5 pb-[env(safe-area-inset-bottom)]">
         <div className="flex items-center overflow-x-auto px-1 py-1.5 gap-1 scrollbar-hide scroll-smooth">
           {MAIN_TABS.map(t => (

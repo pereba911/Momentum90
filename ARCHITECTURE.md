@@ -1,11 +1,11 @@
-# Goal Assistant 90 — Arquitectura
+# Goal Assist 90 — Arquitectura
 
 Documento de referencia arquitectónica del proyecto. La fuente de verdad operativa es el código y esta política.
 
-> **Producto:** Goal Assistant 90 — ejecución personal, metas, plan 90/120, hábitos,
+> **Producto:** Goal Assist 90 — ejecución personal, metas, plan 90/120, hábitos,
 > tareas, logros y oportunidades. Producción: https://goalassist90.netlify.app/.
-> Los datos financieros históricos de Momentum 90
-> (la referencia financiera externa) se conservan íntegros en la nube y nunca se borran ni se duplican.
+> Los datos históricos que ya guardaron los usuarios (incluida la contabilidad financiera previa)
+> se conservan íntegros en la nube y nunca se borran ni se duplican.
 
 ---
 
