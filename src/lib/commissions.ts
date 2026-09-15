@@ -11,7 +11,9 @@
 //     devuelven copias nuevas.
 //   * SOLO las comisiones totalmente liquidadas suman al progreso de las metas.
 //   * Nada se borra físicamente: los abonos se anulan (voided + voidedAt) y se
-//     conservan en el historial; una comisión con abonos nunca se elimina.
+//     conservan en el historial. Una comisión SIN abonos se puede eliminar; una
+//     comisión CON abonos solo se archiva (deletedAt) y siempre es restaurable,
+//     porque su historial de abonos es información del usuario.
 //   * El monto de la meta vive en monthlyGoal/quarterlyGoal (una sola fuente de
 //     verdad, compatible con los datos históricos del usuario). Este módulo solo
 //     registra los REAJUSTES en goalAdjustments (bitácora, nunca el valor actual).
@@ -44,6 +46,9 @@ export interface Commission {
   settledAt?: string;
   createdAt?: string;
   updatedAt?: string;
+  /** Eliminación auditada: la comisión (y sus abonos) se conserva en la nube,
+   *  pero deja de listarse y de contar para las metas. Restaurable. */
+  deletedAt?: string;
 }
 
 export interface GoalAdjustment {
@@ -317,10 +322,13 @@ export function effectiveGoalMonth(c: Commission): string {
   return normalizeMonth(normalizeDate(c.commissionDate));
 }
 
-/** Comisiones cuyo mes objetivo cae dentro del período indicado. */
+/**
+ * Comisiones cuyo mes objetivo cae dentro del período indicado.
+ * Excluye las archivadas (eliminadas por el usuario): no cuentan para metas.
+ */
 export function commissionsInPeriod(commissions: Commission[], period: Period): Commission[] {
   const list = Array.isArray(commissions) ? commissions : [];
-  return list.filter(c => c && monthInPeriod(effectiveGoalMonth(c), period));
+  return list.filter(c => c && !isDeleted(c) && monthInPeriod(effectiveGoalMonth(c), period));
 }
 
 /** Suma de comisiones TOTALMENTE liquidadas (lo único que cuenta a la meta). */
@@ -502,6 +510,117 @@ export function removeCommissionIfEmpty(commissions: Commission[], id: string): 
 
 export function canDeleteCommission(c: Commission): boolean {
   return paymentsOf(c).length === 0;
+}
+
+// ─── Editar, eliminar y restaurar comisiones ya registradas ──────────────────
+
+/** ¿La comisión fue eliminada por el usuario? Se conserva archivada en la nube. */
+export function isDeleted(c: Commission | null | undefined): boolean {
+  return !!(c && c.deletedAt);
+}
+
+/** Comisiones vigentes (sin las archivadas): la lista que ve el usuario. */
+export function liveCommissions(commissions: Commission[]): Commission[] {
+  return (Array.isArray(commissions) ? commissions : []).filter(c => c && !isDeleted(c));
+}
+
+/** Comisiones archivadas (papelera): conservan sus abonos y son restaurables. */
+export function archivedCommissions(commissions: Commission[]): Commission[] {
+  return (Array.isArray(commissions) ? commissions : []).filter(c => c && isDeleted(c));
+}
+
+/** Validación de la edición: reglas del alta + nunca bajar de lo ya abonado. */
+export function validateCommissionEdit(
+  commission: Commission,
+  description: string,
+  totalAmount: number,
+  dateStr: string,
+): string | null {
+  const base = validateCommissionInput(description, totalAmount, dateStr);
+  if (base) return base;
+  const paid = paidAmountOf(commission);
+  if (round2(Number(totalAmount)) < paid - 0.005) {
+    return `El total no puede ser menor a lo ya abonado (${paid}). Anula un abono si necesitas reducirlo.`;
+  }
+  return null;
+}
+
+export interface CommissionEditInput {
+  description: string;
+  totalAmount: number;
+  commissionDate: string;
+  goalMonth: string;
+}
+
+/**
+ * Edita una comisión ya registrada conservando su id, sus abonos y su historial
+ * (los derivados se recalculan; el archivado no se altera con una edición).
+ */
+export function editCommission(
+  commissions: Commission[],
+  id: string,
+  input: CommissionEditInput,
+  opts?: { now?: string },
+): Commission[] {
+  const list = Array.isArray(commissions) ? commissions : [];
+  const commissionDate = normalizeDate(input.commissionDate);
+  return list.map(c => {
+    if (c.id !== id) return c;
+    return recalcCommission({
+      ...c,
+      id: c.id,
+      description: String(input.description ?? "").trim(),
+      totalAmount: round2(Number(input.totalAmount) || 0),
+      commissionDate: commissionDate || c.commissionDate,
+      goalMonth: normalizeMonth(input.goalMonth) || normalizeMonth(commissionDate) || effectiveGoalMonth(c),
+      payments: paymentsOf(c),
+      createdAt: c.createdAt,
+      updatedAt: opts?.now ?? new Date().toISOString(),
+    });
+  });
+}
+
+export type CommissionDeleteMode = "deleted" | "archived" | "not-found";
+
+export interface DeleteCommissionResult {
+  commissions: Commission[];
+  mode: CommissionDeleteMode;
+}
+
+/**
+ * Elimina una comisión ya registrada:
+ *  * sin abonos → borrado físico (mode "deleted"): no hay historial que perder.
+ *  * con abonos → archivado auditado (mode "archived"): se marca deletedAt, deja
+ *    de listarse y de contar para las metas, pero se conserva y es restaurable.
+ */
+export function deleteCommission(
+  commissions: Commission[],
+  id: string,
+  opts?: { now?: string },
+): DeleteCommissionResult {
+  const list = Array.isArray(commissions) ? commissions : [];
+  const target = list.find(c => c && c.id === id);
+  if (!target) return { commissions: list, mode: "not-found" };
+  if (paymentsOf(target).length > 0) {
+    const now = opts?.now ?? new Date().toISOString();
+    return {
+      commissions: list.map(c => (c.id === id ? { ...c, deletedAt: now, updatedAt: now } : c)),
+      mode: "archived",
+    };
+  }
+  return { commissions: list.filter(c => c.id !== id), mode: "deleted" };
+}
+
+/** Restaura una comisión archivada: vuelve a listarse y a contar para las metas. */
+export function restoreCommission(commissions: Commission[], id: string, opts?: { now?: string }): Commission[] {
+  const list = Array.isArray(commissions) ? commissions : [];
+  const now = opts?.now ?? new Date().toISOString();
+  return list.map(c => {
+    if (c.id !== id || !c.deletedAt) return c;
+    const restored: Commission = { ...c, updatedAt: now };
+    delete restored.deletedAt;
+    return recalcCommission(restored);
+  });
 }
 
 // ─── Reajustes de meta (bitácora) ────────────────────────────────────────────

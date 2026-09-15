@@ -4,6 +4,8 @@
   Aplicación de **ejecución personal**: metas, plan 90/120, hábitos, tareas, logros,
   oportunidades y seguimiento de progreso, con persistencia y sincronización vía Supabase.
 
+  > **Producción:** https://goalassist90.netlify.app/ (auto-deploy desde `main`).
+  >
   > **Referencia financiera:** Momentum 90 V2 (https://itsmomentum90.netlify.app/) es la
   > aplicación financiera de referencia. Goal Assistant 90 no duplica esa contabilidad como
   > módulos independientes; conserva su propio historial de metas y progreso sin crear una

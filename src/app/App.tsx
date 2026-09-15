@@ -12,14 +12,17 @@ import { api, supabase, SUPABASE_CONFIGURED, DEFAULT_SETTINGS, canAccess, getDay
 import { buildExpenseReportPdf } from "./reportPdf";
 import { goalProgressOf, pickDailyPriorities, nextRecommendedAction, overdueTasks, pendingHabitsToday, habitCountOn, aggregateProgress } from "../lib/core";
 import {
-  addCommission, addPayment, adjustmentsOf, applyGoalTarget, canDeleteCommission,
-  commissionView, commissionsInPeriod, createCommission, createPayment,
-  effectiveGoalMonth, getGoalProgressData, makeId, monthLabelEs, motivationalMessage,
-  normalizeMonth, periodFor, periodSummary, quarterLabelEs, quarterOfMonth,
-  recentPeriods, remainingOf, removeCommissionIfEmpty, round2, settledTotalOf, sortCommissions,
-  statusOf, targetForPeriod, validateCommissionInput, validatePaymentInput, voidPayment,
+  addCommission, addPayment, adjustmentsOf, applyGoalTarget, archivedCommissions,
+  canDeleteCommission, commissionView, commissionsInPeriod, createCommission,
+  createPayment, deleteCommission, editCommission, effectiveGoalMonth,
+  getGoalProgressData, liveCommissions, makeId, monthLabelEs,
+  motivationalMessage, normalizeMonth, paidAmountOf, periodFor, periodSummary, quarterLabelEs,
+  quarterOfMonth, recentPeriods, remainingOf, restoreCommission, round2,
+  settledTotalOf, sortCommissions, statusOf, targetForPeriod,
+  validateCommissionEdit, validateCommissionInput, validatePaymentInput,
+  voidPayment,
   COMMISSION_STATUS_META,
-  type Commission, type CommissionPayment, type CommissionStatus, type GoalAdjustment,
+  type Commission, type CommissionEditInput, type CommissionPayment, type CommissionStatus, type GoalAdjustment,
   type GoalProgress, type GoalTargetType,
 } from "../lib/commissions";
 import {
@@ -253,7 +256,7 @@ function countKeyTasksDoneToday(tasks: Task[]): number {
 // Preferencia visual global de ocultar montos (fuera de AppState → no dispara autosave).
 let hideAmountsGlobal = false;
 function setHideAmountsGlobal(v: boolean) { hideAmountsGlobal = v; }
-function fmt(n: number, c: Currency = "MXN"): string { const s: Record<Currency, string> = { MXN: "$", USD: "US$", EUR: "€" }; if (hideAmountsGlobal) return `${s[c]} ••••••`; const v = Math.round(n); if (v >= 1e6) return `${s[c]}${(v / 1e6).toFixed(1)}M`; if (v >= 1000) return `${s[c]}${(v / 1000).toFixed(0)}K`; return `${s[c]}${v.toLocaleString("es-MX")}`; }
+function fmt(n: number, c: Currency = "MXN"): string { const s: Record<Currency, string> = { MXN: "$", USD: "US$", EUR: "€" }; if (hideAmountsGlobal) return `${s[c]} ••••••`; const v = Math.round(n); if (v >= 1e6) return `${s[c]}${(v / 1e6).toFixed(1).replace(/\.0$/, "")}M`; if (v >= 1000) return `${s[c]}${(v / 1000).toFixed(1).replace(/\.0$/, "")}K`; return `${s[c]}${v.toLocaleString("es-MX")}`; }
 function pct(v: number, t: number): number { return t === 0 ? 0 : Math.min(100, Math.round((v / t) * 100)); }
 function getQ(d = new Date()): number { return Math.floor(d.getMonth() / 3) + 1; }
 function getQYear(d = new Date()): number { return d.getFullYear(); }
@@ -1329,24 +1332,31 @@ function PaymentForm({ commission, currency, onSubmit, onCancel }: {
   );
 }
 
-/** Alta de una comisión (con mes objetivo al que sumará). */
-function CommissionForm({ currency, defaultMonth, onSubmit, onCancel }: {
-  currency: Currency; defaultMonth: string;
-  onSubmit: (c: Commission) => void; onCancel: () => void;
+/** Alta o edición de una comisión (con mes objetivo al que sumará). */
+function CommissionForm({ currency, defaultMonth, initial, onSubmit, onCancel }: {
+  currency: Currency; defaultMonth: string; initial?: Commission | null;
+  onSubmit: (values: CommissionEditInput) => void; onCancel: () => void;
 }) {
-  const [description, setDescription] = useState("");
-  const [amount, setAmount] = useState("");
-  const [date, setDate] = useState(todayLocal());
-  const [goalMonth, setGoalMonth] = useState(defaultMonth || todayLocal().slice(0, 7));
+  const editando = !!initial;
+  const [description, setDescription] = useState(initial?.description ?? "");
+  const [amount, setAmount] = useState(initial ? String(initial.totalAmount) : "");
+  const [date, setDate] = useState(initial?.commissionDate || todayLocal());
+  const [goalMonth, setGoalMonth] = useState(initial?.goalMonth || defaultMonth || todayLocal().slice(0, 7));
   const [err, setErr] = useState<string | null>(null);
+  const abonado = initial ? paidAmountOf(initial) : 0;
   const submit = () => {
-    const e = validateCommissionInput(description, Number(amount), date);
+    const e = initial
+      ? validateCommissionEdit(initial, description, Number(amount), date)
+      : validateCommissionInput(description, Number(amount), date);
     if (e) { setErr(e); return; }
     if (!normalizeMonth(goalMonth)) { setErr("Selecciona el mes al que suma esta comisión."); return; }
-    onSubmit(createCommission({ description, totalAmount: Number(amount), commissionDate: date, goalMonth }));
+    onSubmit({ description: description.trim(), totalAmount: Number(amount), commissionDate: date, goalMonth });
   };
   return (
-    <div className="bg-[#0D0D12] rounded-xl p-4 border border-white/8 mb-4 space-y-3">
+    <div className="bg-[#0D0D12] rounded-xl p-4 border border-[#9D4EDD]/30 mb-4 space-y-3">
+      <p className="text-xs font-semibold text-white">
+        {editando ? "✏️ Editar comisión registrada" : "Nueva comisión"}
+      </p>
       <input value={description} onChange={e => { setDescription(e.target.value); setErr(null); }} placeholder="Descripción (ej. Comisión cliente X)" autoFocus
         className="w-full bg-[#16161F] border border-white/10 text-white rounded-xl px-3 py-2.5 text-sm placeholder-gray-700 focus:outline-none focus:border-[#9D4EDD]/60" />
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
@@ -1366,22 +1376,32 @@ function CommissionForm({ currency, defaultMonth, onSubmit, onCancel }: {
             className="w-full bg-[#16161F] border border-white/10 text-white rounded-xl px-3 py-2 text-sm focus:outline-none focus:border-[#9D4EDD]/60" />
         </div>
       </div>
-      <p className="text-[11px] text-gray-500">💡 La comisión empieza en 🔴 pendiente y solo sumará a tu meta cuando esté 100% liquidada (🟢).</p>
+      {editando ? (
+        <p className="text-[11px] text-gray-500">
+          ✏️ La edición conserva los abonos y el historial. Ya abonado: <span className="text-white font-semibold">{fmt(abonado, currency)}</span>
+          {abonado > 0 ? " · el total no puede quedar por debajo de ese monto." : "."}
+        </p>
+      ) : (
+        <p className="text-[11px] text-gray-500">💡 La comisión empieza en 🔴 pendiente y solo sumará a tu meta cuando esté 100% liquidada (🟢).</p>
+      )}
       {err && <p className="text-[11px] text-red-400">{err}</p>}
       <div className="flex gap-2">
-        <button onClick={submit} className="min-h-11 px-4 rounded-xl bg-[#9D4EDD] text-white text-sm font-semibold hover:bg-[#7B2CBF]">Guardar comisión</button>
+        <button onClick={submit} className="min-h-11 px-4 rounded-xl bg-[#9D4EDD] text-white text-sm font-semibold hover:bg-[#7B2CBF]">
+          {editando ? "Guardar cambios" : "Guardar comisión"}
+        </button>
         <button onClick={onCancel} className="min-h-11 px-4 rounded-xl bg-white/5 text-gray-300 text-sm font-medium hover:bg-white/10">Cancelar</button>
       </div>
     </div>
   );
 }
 
-/** Comisión individual: estado, abonos, anulación auditada y borrado seguro. */
-function CommissionCard({ commission, currency, expanded, onToggle, onAddPayment, onVoidPayment, onDelete }: {
+/** Comisión individual: estado, abonos, anulación auditada, edición y eliminación. */
+function CommissionCard({ commission, currency, expanded, onToggle, onAddPayment, onVoidPayment, onEdit, onDelete }: {
   commission: Commission; currency: Currency; expanded: boolean;
   onToggle: () => void;
   onAddPayment: (payment: CommissionPayment) => void;
   onVoidPayment: (paymentId: string) => void;
+  onEdit: () => void;
   onDelete: () => void;
 }) {
   const [confirmVoid, setConfirmVoid] = useState<CommissionPayment | null>(null);
@@ -1426,11 +1446,12 @@ function CommissionCard({ commission, currency, expanded, onToggle, onAddPayment
         {v.status !== "paid" && !expanded && (
           <button onClick={onToggle} className="min-h-11 px-3 rounded-xl bg-emerald-500/15 border border-emerald-500/25 text-emerald-300 text-xs font-medium hover:bg-emerald-500/25">💰 Nuevo abono</button>
         )}
-        {canDeleteCommission(commission) && (
-          <button onClick={() => setConfirmDelete(true)} className="min-h-11 px-3 rounded-xl bg-white/5 text-gray-400 text-xs font-medium hover:bg-red-500/10 hover:text-red-300 inline-flex items-center gap-1">
-            <Trash2 size={12} /> Eliminar
-          </button>
-        )}
+        <button onClick={onEdit} className="min-h-11 px-3 rounded-xl bg-white/5 text-gray-300 text-xs font-medium hover:bg-white/10 inline-flex items-center gap-1">
+          <Pencil size={12} /> Editar
+        </button>
+        <button onClick={() => setConfirmDelete(true)} className="min-h-11 px-3 rounded-xl bg-white/5 text-gray-400 text-xs font-medium hover:bg-red-500/10 hover:text-red-300 inline-flex items-center gap-1">
+          <Trash2 size={12} /> Eliminar
+        </button>
       </div>
 
       {expanded && (
@@ -1471,8 +1492,10 @@ function CommissionCard({ commission, currency, expanded, onToggle, onAddPayment
       {confirmDelete && (
         <ConfirmDialog
           title="Eliminar comisión"
-          message="Esta comisión no tiene abonos registrados, por lo que puede eliminarse. Las comisiones con historial de abonos nunca se borran."
-          confirmLabel="Eliminar"
+          message={canDeleteCommission(commission)
+            ? `Se eliminará "${commission.description}" (${fmt(v.total, currency)}). No tiene abonos registrados, así que no hay historial que perder.`
+            : `"${commission.description}" tiene ${v.paymentCount + v.voidedCount} abono(s) registrados, así que se archivará: dejará de listarse y de contar para tus metas, pero su historial se conserva en tu cuenta y podrás restaurarla desde la papelera.`}
+          confirmLabel={canDeleteCommission(commission) ? "Eliminar" : "Archivar"}
           onConfirm={() => { setConfirmDelete(false); onDelete(); }}
           onCancel={() => setConfirmDelete(false)}
         />
@@ -1485,10 +1508,14 @@ function CommissionCard({ commission, currency, expanded, onToggle, onAddPayment
 function CommissionsSection({ s, set, currency, notify }: {
   s: AppState; set: (x: AppState) => void; currency: Currency; notify: (text: string, tone?: ToastTone) => void;
 }) {
-  const commissions = s.commissions ?? [];
+  const all = s.commissions ?? [];
+  const commissions = liveCommissions(all);            // vigentes (sin archivadas)
+  const archivadas = archivedCommissions(all);         // papelera (historial conservado)
   const todayStr = todayLocal();
   const [showForm, setShowForm] = useState(false);
+  const [editingId, setEditingId] = useState<string | null>(null);
   const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [showTrash, setShowTrash] = useState(false);
   const [filterStatus, setFilterStatus] = useState<"all" | CommissionStatus>("all");
   const [filterMonth, setFilterMonth] = useState("all");
 
@@ -1501,26 +1528,42 @@ function CommissionsSection({ s, set, currency, notify }: {
     return true;
   }));
 
-  const agregar = (c: Commission) => {
-    set({ ...s, commissions: addCommission(commissions, c) });
+  const agregar = (values: CommissionEditInput) => {
+    const c = createCommission(values);
+    set({ ...s, commissions: addCommission(all, c) });
     setShowForm(false);
+    setEditingId(null);
     setExpandedId(c.id);
     notify(`💸 Comisión "${c.description}" registrada. Sumará a tu meta al liquidarse 🟢`);
   };
+  const guardarEdicion = (id: string, values: CommissionEditInput) => {
+    set({ ...s, commissions: editCommission(all, id, values) });
+    setEditingId(null);
+    notify("✏️ Comisión actualizada: se conservan sus abonos y su historial.");
+  };
   const registrarAbono = (id: string, payment: CommissionPayment) => {
-    const next = addPayment(commissions, id, payment);
+    const next = addPayment(all, id, payment);
     set({ ...s, commissions: next });
     const c = next.find(x => x.id === id);
     if (c && statusOf(c) === "paid") notify("🟢 ¡Comisión liquidada! Ya cuenta para tu meta.");
     else notify("🟡 Abono registrado. La comisión sigue en proceso: aún no suma a la meta.", "warn");
   };
   const anularAbono = (id: string, paymentId: string) => {
-    set({ ...s, commissions: voidPayment(commissions, id, paymentId) });
+    set({ ...s, commissions: voidPayment(all, id, paymentId) });
     notify("Abono anulado: el registro se conserva en el historial.", "warn");
   };
   const eliminar = (id: string) => {
-    set({ ...s, commissions: removeCommissionIfEmpty(commissions, id) });
-    notify("Comisión eliminada (no tenía abonos registrados).");
+    const { commissions: next, mode } = deleteCommission(all, id);
+    set({ ...s, commissions: next });
+    if (editingId === id) setEditingId(null);
+    if (expandedId === id) setExpandedId(null);
+    notify(mode === "archived"
+      ? "Comisión archivada: su historial de abonos se conserva y puedes restaurarla desde la papelera."
+      : "Comisión eliminada (no tenía abonos registrados).", mode === "archived" ? "warn" : "ok");
+  };
+  const restaurar = (id: string) => {
+    set({ ...s, commissions: restoreCommission(all, id) });
+    notify("Comisión restaurada: vuelve a listarse y a contar para tus metas.");
   };
 
   const chips: { id: "all" | CommissionStatus; label: string }[] = [
@@ -1535,7 +1578,7 @@ function CommissionsSection({ s, set, currency, notify }: {
       <div className="flex items-start justify-between gap-3 mb-3">
         <div className="min-w-0">
           <p className="text-xs text-gray-500 uppercase tracking-wider">Comisiones y Abonos 💸</p>
-          <p className="text-[11px] text-gray-600 mt-1">Solo las comisiones liquidadas 🟢 suman a tus metas. Los abonos parciales quedan en proceso 🟡.</p>
+          <p className="text-[11px] text-gray-600 mt-1">Solo las comisiones liquidadas 🟢 suman a tus metas. Los abonos parciales quedan en proceso 🟡. Cada comisión registrada se puede editar o eliminar cuando quieras.</p>
         </div>
         <button onClick={() => setShowForm(!showForm)} className="shrink-0 min-h-11 px-3 rounded-xl bg-[#9D4EDD] text-white text-xs font-semibold hover:bg-[#7B2CBF] inline-flex items-center gap-1.5">
           <Plus size={13} /> Nueva comisión
@@ -1580,23 +1623,62 @@ function CommissionsSection({ s, set, currency, notify }: {
 
       {filtered.length === 0 ? (
         <div className="text-center py-6">
-          <p className="text-sm text-gray-500">Sin comisiones registradas.</p>
+          <p className="text-sm text-gray-500">{commissions.length === 0 ? "Sin comisiones registradas." : "Ninguna comisión coincide con los filtros."}</p>
           <p className="text-[11px] text-gray-600 mt-1">Registra tu primera comisión: se sumará a la meta cuando esté 100% liquidada.</p>
         </div>
       ) : (
         <div className="space-y-3">
           {filtered.map(c => (
-            <CommissionCard
-              key={c.id}
-              commission={c}
-              currency={currency}
-              expanded={expandedId === c.id}
-              onToggle={() => setExpandedId(expandedId === c.id ? null : c.id)}
-              onAddPayment={p => registrarAbono(c.id, p)}
-              onVoidPayment={pid => anularAbono(c.id, pid)}
-              onDelete={() => eliminar(c.id)}
-            />
+            editingId === c.id ? (
+              <CommissionForm
+                key={c.id}
+                currency={currency}
+                defaultMonth={mesActual}
+                initial={c}
+                onSubmit={values => guardarEdicion(c.id, values)}
+                onCancel={() => setEditingId(null)}
+              />
+            ) : (
+              <CommissionCard
+                key={c.id}
+                commission={c}
+                currency={currency}
+                expanded={expandedId === c.id}
+                onToggle={() => setExpandedId(expandedId === c.id ? null : c.id)}
+                onAddPayment={p => registrarAbono(c.id, p)}
+                onVoidPayment={pid => anularAbono(c.id, pid)}
+                onEdit={() => { setEditingId(c.id); setExpandedId(null); }}
+                onDelete={() => eliminar(c.id)}
+              />
+            )
           ))}
+        </div>
+      )}
+
+      {archivadas.length > 0 && (
+        <div className="mt-4 border-t border-white/8 pt-3">
+          <button onClick={() => setShowTrash(!showTrash)} className="min-h-11 px-3 rounded-xl bg-white/5 text-gray-400 text-[11px] font-medium hover:bg-white/10 inline-flex items-center gap-1.5">
+            <History size={12} /> Papelera ({archivadas.length}) {showTrash ? "▴" : "▾"}
+          </button>
+          {showTrash && (
+            <div className="mt-3 space-y-2">
+              <p className="text-[11px] text-gray-600">Comisiones eliminadas con historial de abonos: se conservan completas y puedes restaurarlas. Ninguna de ellas suma a tus metas mientras esté aquí.</p>
+              {archivadas.map(c => {
+                const cv = commissionView(c);
+                return (
+                  <div key={c.id} className="flex items-center justify-between gap-2 rounded-xl border border-white/8 bg-[#0D0D12] px-3 py-2 opacity-80">
+                    <div className="min-w-0">
+                      <p className="text-xs text-white font-medium truncate">{c.description}</p>
+                      <p className="text-[10px] text-gray-600">
+                        {fmt(cv.total, currency)} · eliminada el {String(c.deletedAt || "").slice(0, 10)} · {cv.paymentCount} abono(s) conservados
+                      </p>
+                    </div>
+                    <button onClick={() => restaurar(c.id)} className="shrink-0 min-h-11 px-3 rounded-xl bg-[#9D4EDD]/15 border border-[#9D4EDD]/25 text-[#c084fc] text-[11px] font-medium hover:bg-[#9D4EDD]/25">Restaurar</button>
+                  </div>
+                );
+              })}
+            </div>
+          )}
         </div>
       )}
     </Card>

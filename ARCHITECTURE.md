@@ -3,9 +3,9 @@
 Documento de referencia arquitectónica del proyecto. La fuente de verdad operativa es el código y esta política.
 
 > **Producto:** Goal Assistant 90 — ejecución personal, metas, plan 90/120, hábitos,
-> tareas, logros y oportunidades. Los datos financieros históricos de Momentum 90
-> (la referencia financiera externa) se conservan íntegros en el registro secundario
-> "Registro financiero · Momentum 90 (referencia)" y nunca se borran ni se duplican.
+> tareas, logros y oportunidades. Producción: https://goalassist90.netlify.app/.
+> Los datos financieros históricos de Momentum 90
+> (la referencia financiera externa) se conservan íntegros en la nube y nunca se borran ni se duplican.
 
 ---
 
@@ -124,5 +124,9 @@ Antes de considerar una feature lista para publicar, verificar:
 - Cliente Supabase: `src/lib/supabase.ts` (sesión con `access_token`; mutaciones vía servidor que resuelve `user.id`).
 - Metas del mes / trimestre y comisiones con abonos parciales: lógica pura en `src/lib/commissions.ts`; UI en `HoyTab` (tarjetas de meta, celebración) y `CapitalTab` (área Metas: configuración + comisiones). Entidades persistidas en Supabase: `commissions` y `goalAdjustments`.
 - Regla de oro de progreso: **solo las comisiones liquidadas al 100% (estado `paid`, 🟢) suman a la meta**; los abonos parciales (🟡) y las comisiones sin abonos (🔴) no cuentan.
-- Los abonos nunca se borran físicamente: se anulan con auditoría (`voided` / `voidedAt`) y solo se elimina una comisión si no tiene abonos (`canDeleteCommission` / `removeCommissionIfEmpty`).
+- Los abonos nunca se borran físicamente: se anulan con auditoría (`voided` / `voidedAt`).
+- Comisiones registradas: se pueden **editar** (`editCommission`, conserva id, abonos e historial; el total nunca puede quedar por debajo de lo abonado → `validateCommissionEdit`) y **eliminar** (`deleteCommission`):
+  - sin abonos → borrado físico (no hay historial que perder);
+  - con abonos → archivado auditado (`deletedAt`), deja de listarse y de contar para las metas, pero se conserva **restaurable** desde la papelera (`restoreCommission`).
+  Las funciones puras `commissionsInPeriod`, `periodSummary` y `getGoalProgressData` excluyen siempre las archivadas, así que una comisión eliminada jamás infla ni bloquea una meta.
 - Fuente única de verdad del monto de meta: `monthlyGoal.target` / `quarterlyGoal.target`; `goalAdjustments` es bitácora append-only generada por `applyGoalTarget`.

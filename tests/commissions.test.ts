@@ -57,6 +57,13 @@ import {
   validateCommissionInput,
   validatePaymentInput,
   voidPayment,
+  archivedCommissions,
+  deleteCommission,
+  editCommission,
+  isDeleted,
+  liveCommissions,
+  restoreCommission,
+  validateCommissionEdit,
 } from "../src/lib/commissions";
 
 const TODAY = "2026-08-15";
@@ -542,6 +549,131 @@ describe("Bitácora de reajustes de meta", () => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 
+describe("Comisiones registradas: editar y eliminar (sin perder datos)", () => {
+  it("editCommission actualiza los datos y conserva id, abonos e historial", () => {
+    const c = withPayments(com("e1", 1000), [pay("p1", 400, "2026-08-10")]);
+    const out = editCommission([c], "e1", {
+      description: "Cliente corregido",
+      totalAmount: 1200,
+      commissionDate: "2026-07-20",
+      goalMonth: "2026-09",
+    });
+    const e = out[0];
+    expect(out).toHaveLength(1);
+    expect(e.id).toBe("e1");
+    expect(e.description).toBe("Cliente corregido");
+    expect(totalOf(e)).toBe(1200);
+    expect(e.commissionDate).toBe("2026-07-20");
+    expect(effectiveGoalMonth(e)).toBe("2026-09");
+    expect(e.payments).toHaveLength(1);
+    expect(e.payments[0].amount).toBe(400);
+    expect(e.payments[0].date).toBe("2026-08-10");
+    expect(paidAmountOf(e)).toBe(400);
+    expect(statusOf(e)).toBe("partial");
+  });
+
+  it("editar puede liquidar una comisión (el abono ya cubre el nuevo total)", () => {
+    const c = withPayments(com("e2", 1000), [pay("p1", 400, "2026-08-10")]);
+    const e = editCommission([c], "e2", {
+      description: c.description,
+      totalAmount: 400,
+      commissionDate: c.commissionDate,
+      goalMonth: c.goalMonth,
+    })[0];
+    expect(statusOf(e)).toBe("paid");
+    expect(remainingOf(e)).toBe(0);
+    expect(settledAtOf(e)).toBe("2026-08-10");
+  });
+
+  it("la edición nunca deja el total por debajo de lo ya abonado", () => {
+    const c = withPayments(com("e3", 1000), [pay("p1", 600, "2026-08-10")]);
+    expect(validateCommissionEdit(c, "X", 500, TODAY)).toMatch(/no puede ser menor/i);
+    expect(validateCommissionEdit(c, "X", 600, TODAY)).toBeNull();
+    expect(validateCommissionEdit(c, "X", 900, TODAY)).toBeNull();
+    // las reglas del alta siguen vigentes
+    expect(validateCommissionEdit(c, "", 900, TODAY)).toMatch(/descripción/i);
+    expect(validateCommissionEdit(c, "X", 0, TODAY)).toMatch(/mayor a 0/i);
+    expect(validateCommissionEdit(c, "X", 900, "mal")).toMatch(/fecha/i);
+  });
+
+  it("editar una comisión inexistente no altera la colección", () => {
+    const list = [com("e4", 100)];
+    expect(editCommission(list, "otro", {
+      description: "Nada", totalAmount: 50, commissionDate: TODAY, goalMonth: "2026-08",
+    })).toHaveLength(1);
+    expect(editCommission(list, "otro", {
+      description: "Nada", totalAmount: 50, commissionDate: TODAY, goalMonth: "2026-08",
+    })[0].description).toBe("Comisión e4");
+  });
+
+  it("deleteCommission borra físicamente solo si no hay abonos registrados", () => {
+    const vacia = com("d1", 300);
+    const r = deleteCommission([vacia], "d1");
+    expect(r.mode).toBe("deleted");
+    expect(r.commissions).toHaveLength(0);
+    // con abonos (aunque estén anulados) nunca se borra: se archiva
+    const conAbonos = withPayments(com("d2", 300), [pay("p1", 100, "2026-08-10")]);
+    const r2 = deleteCommission([conAbonos], "d2");
+    expect(r2.mode).toBe("archived");
+    expect(r2.commissions).toHaveLength(1);
+    expect(isDeleted(r2.commissions[0])).toBe(true);
+    expect(r2.commissions[0].payments).toHaveLength(1);
+    // id inexistente: no-op
+    expect(deleteCommission([vacia], "otro").mode).toBe("not-found");
+  });
+
+  it("una comisión eliminada deja de contar para la meta y de listarse", () => {
+    const pagada = withPayments(com("d3", 1000), [pay("p1", 1000, "2026-08-10")]);
+    const otras = [com("d4", 500)];
+    const antes = getGoalProgressData([pagada, ...otras], 1000, "monthly", TODAY);
+    expect(antes.current).toBe(1000);
+    expect(antes.percentage).toBe(100);
+
+    const { commissions: despues } = deleteCommission([pagada, ...otras], "d3");
+    const meta = getGoalProgressData(despues, 1000, "monthly", TODAY);
+    expect(meta.current).toBe(0);
+    expect(meta.settledCount).toBe(0);
+    expect(periodSummary(despues, "monthly", TODAY).settled).toBe(0);
+    expect(commissionsInPeriod(despues, periodFor("monthly", TODAY))).toHaveLength(1);
+    expect(liveCommissions(despues).map(c => c.id)).toEqual(["d4"]);
+    expect(archivedCommissions(despues).map(c => c.id)).toEqual(["d3"]);
+    expect(sortCommissions(liveCommissions(despues)).map(c => c.id)).toEqual(["d4"]);
+  });
+
+  it("restoreCommission devuelve la comisión a la vista y a la meta con su historial", () => {
+    const pagada = withPayments(com("d5", 1000), [pay("p1", 1000, "2026-08-10")]);
+    const { commissions: archivada } = deleteCommission([pagada], "d5", { now: NOW });
+    const restored = restoreCommission(archivada, "d5", { now: "2026-08-20T00:00:00.000Z" })[0];
+    expect(isDeleted(restored)).toBe(false);
+    expect(restored.deletedAt).toBeUndefined();
+    expect(restored.payments).toHaveLength(1);
+    expect(restored.status).toBe("paid");
+    expect(getGoalProgressData([restored], 1000, "monthly", TODAY).current).toBe(1000);
+    // restaurar algo que no está archivado es no-op
+    expect(restoreCommission([restored], "d5")[0].deletedAt).toBeUndefined();
+  });
+
+  it("editar una comisión archivada no la resucita", () => {
+    const { commissions: archivada } = deleteCommission([com("d6", 100)], "d6");
+    expect(liveCommissions(archivada)).toHaveLength(0);
+    const editada = editCommission([{ ...archivada[0], deletedAt: NOW, payments: [pay("p1", 10, "2026-08-10")] }], "d6", {
+      description: "Tocada", totalAmount: 200, commissionDate: TODAY, goalMonth: "2026-08",
+    })[0];
+    expect(isDeleted(editada)).toBe(true);
+    expect(liveCommissions([editada])).toHaveLength(0);
+  });
+
+  it("eliminar/editar/restaurar no mutan las colecciones recibidas", () => {
+    const c = withPayments(com("d7", 1000), [pay("p1", 200, "2026-08-10")]);
+    const list = [c];
+    const before = JSON.stringify(list);
+    editCommission(list, "d7", { description: "Otra", totalAmount: 900, commissionDate: TODAY, goalMonth: "2026-08" });
+    const { commissions: archived } = deleteCommission(list, "d7", { now: NOW });
+    restoreCommission(archived, "d7");
+    expect(JSON.stringify(list)).toBe(before);
+  });
+});
+
 describe("Integración con la app (App.tsx y persistencia en la nube)", () => {
   let app = "";
   beforeAll(() => {
@@ -590,6 +722,25 @@ describe("Integración con la app (App.tsx y persistencia en la nube)", () => {
   it("hay una celebración al alcanzar la meta y un mensaje motivacional dinámico", () => {
     expect(app).toContain("celebrate");
     expect(app).toMatch(/motivationalMessage\(/);
+  });
+
+  it("la UI permite editar y eliminar comisiones ya registradas", () => {
+    // formulario en modo edición (reutiliza CommissionForm con la comisión actual)
+    expect(app).toContain("initial?: Commission | null");
+    expect(app).toContain("Editar comisión registrada");
+    expect(app).toContain("Guardar cambios");
+    expect(app).toMatch(/editCommission\(/);
+    expect(app).toMatch(/validateCommissionEdit\(/);
+    // borrado disponible siempre en la tarjeta, con confirmación
+    expect(app).toContain("onEdit");
+    expect(app).toMatch(/deleteCommission\(/);
+    expect(app).not.toContain("canDeleteCommission(commission) &&");
+    // papelera + restauración (nunca se pierde el historial de abonos)
+    expect(app).toMatch(/archivedCommissions\(/);
+    expect(app).toMatch(/liveCommissions\(/);
+    expect(app).toContain("Papelera");
+    expect(app).toContain("Restaurar");
+    expect(app).toMatch(/restoreCommission\(/);
   });
 
   it("la captura sigue siendo manual: sin voz en las comisiones", () => {
