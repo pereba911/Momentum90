@@ -73,7 +73,10 @@ export type AppEntityName =
   | "habitLogs"
   | "miniVictories"
   | "quarterHistory"
-  | "assets";
+  | "assets"
+  // Metas del mes/trimestre: comisiones con abonos parciales y bitácora de reajustes
+  | "commissions"
+  | "goalAdjustments";
 
 export type AssetType = "cash" | "bank" | "investment" | "property" | "business" | "vehicle" | "receivable" | "other";
 

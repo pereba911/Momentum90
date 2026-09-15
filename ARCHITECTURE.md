@@ -122,3 +122,7 @@ Antes de considerar una feature lista para publicar, verificar:
 - Defaults de etapas: `DEFAULT_BIZ_STAGES` / `DEFAULT_CONTACT_STAGES` en `src/app/App.tsx` (fallback en memoria, nunca auto-persistidos).
 - Rol administrativo: `profile.role === "admin"` (solo para acciones administrativas explícitas; no condiciona features globales).
 - Cliente Supabase: `src/lib/supabase.ts` (sesión con `access_token`; mutaciones vía servidor que resuelve `user.id`).
+- Metas del mes / trimestre y comisiones con abonos parciales: lógica pura en `src/lib/commissions.ts`; UI en `HoyTab` (tarjetas de meta, celebración) y `CapitalTab` (área Metas: configuración + comisiones). Entidades persistidas en Supabase: `commissions` y `goalAdjustments`.
+- Regla de oro de progreso: **solo las comisiones liquidadas al 100% (estado `paid`, 🟢) suman a la meta**; los abonos parciales (🟡) y las comisiones sin abonos (🔴) no cuentan.
+- Los abonos nunca se borran físicamente: se anulan con auditoría (`voided` / `voidedAt`) y solo se elimina una comisión si no tiene abonos (`canDeleteCommission` / `removeCommissionIfEmpty`).
+- Fuente única de verdad del monto de meta: `monthlyGoal.target` / `quarterlyGoal.target`; `goalAdjustments` es bitácora append-only generada por `applyGoalTarget`.

@@ -179,3 +179,42 @@
     line-height: 1.5;
   }
 }
+
+/* ─── Goal Assistant 90 · celebración y avisos (CSS puro, sin librerías) ───── */
+@keyframes gaCelebrate {
+  0%   { opacity: 0; }
+  12%  { opacity: 1; }
+  100% { opacity: 0; }
+}
+@keyframes gaToastIn {
+  from { opacity: 0; transform: translate(-50%, 12px); }
+  to   { opacity: 1; transform: translate(-50%, 0); }
+}
+@keyframes gaConfetti {
+  0%   { transform: translateY(-30%) scale(0.7); opacity: 0; }
+  25%  { opacity: 0.9; }
+  100% { transform: translateY(120%) scale(1.15); opacity: 0; }
+}
+
+/* Halo de celebración al alcanzar la meta (confeti ligero por gradientes). */
+.ga-celebrate {
+  background-image:
+    radial-gradient(circle at 12% 8%, rgba(250, 204, 21, 0.55) 0 6%, transparent 7%),
+    radial-gradient(circle at 30% 0%, rgba(157, 78, 221, 0.5) 0 5%, transparent 6%),
+    radial-gradient(circle at 52% 6%, rgba(16, 185, 129, 0.5) 0 6%, transparent 7%),
+    radial-gradient(circle at 72% 0%, rgba(59, 130, 246, 0.5) 0 5%, transparent 6%),
+    radial-gradient(circle at 90% 10%, rgba(250, 204, 21, 0.45) 0 6%, transparent 7%);
+  background-repeat: no-repeat;
+  animation: gaCelebrate 5.2s ease-out forwards, gaConfetti 5.2s ease-out forwards;
+}
+
+.ga-toast {
+  animation: gaToastIn 0.22s ease-out;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ga-celebrate,
+  .ga-toast {
+    animation: none;
+  }
+}

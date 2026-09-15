@@ -12,6 +12,17 @@ import { api, supabase, SUPABASE_CONFIGURED, DEFAULT_SETTINGS, canAccess, getDay
 import { buildExpenseReportPdf } from "./reportPdf";
 import { goalProgressOf, pickDailyPriorities, nextRecommendedAction, overdueTasks, pendingHabitsToday, habitCountOn, aggregateProgress } from "../lib/core";
 import {
+  addCommission, addPayment, adjustmentsOf, applyGoalTarget, canDeleteCommission,
+  commissionView, commissionsInPeriod, createCommission, createPayment,
+  effectiveGoalMonth, getGoalProgressData, makeId, monthLabelEs, motivationalMessage,
+  normalizeMonth, periodFor, periodSummary, quarterLabelEs, quarterOfMonth,
+  recentPeriods, remainingOf, removeCommissionIfEmpty, round2, settledTotalOf, sortCommissions,
+  statusOf, targetForPeriod, validateCommissionInput, validatePaymentInput, voidPayment,
+  COMMISSION_STATUS_META,
+  type Commission, type CommissionPayment, type CommissionStatus, type GoalAdjustment,
+  type GoalProgress, type GoalTargetType,
+} from "../lib/commissions";
+import {
   AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer,
   RadarChart, Radar, PolarGrid, PolarAngleAxis,
   PieChart, Pie, Cell, BarChart, Bar
@@ -146,6 +157,11 @@ interface AppState {
   cashFlowStartConfirmedAt?: string;      // timestamp de confirmación
   cashMovements?: CashFlowMovement[];     // colchón / inversión / transferencia / compromiso
   monthlyGoal: { target: number }; quarterlyGoal: { target: number };
+  // ── Metas del Mes 🌙 / Trimestral 📅 (aditivo, compatible con datos históricos) ──
+  // commissions: comisiones con abonos parciales. SOLO las liquidadas suman a las metas.
+  // goalAdjustments: bitácora append-only de reajustes de meta (nunca reemplaza el valor vigente).
+  commissions: Commission[];
+  goalAdjustments: GoalAdjustment[];
   stageNames: [string, string, string];
   currency: Currency;
   habitConfigs: HabitConfig[]; habitLogs: HabitLog[];
@@ -691,6 +707,8 @@ function mergeSavedState(parsed: Partial<AppState>): AppState {
     finance: { ...INIT.finance, ...(parsed.finance || {}) },
     monthlyGoal: { ...INIT.monthlyGoal, ...(parsed.monthlyGoal || {}) },
     quarterlyGoal: { ...INIT.quarterlyGoal, ...(parsed.quarterlyGoal || {}) },
+    commissions: parsed.commissions || [],
+    goalAdjustments: parsed.goalAdjustments || [],
     emergencyFund: { ...INIT.emergencyFund, ...(parsed.emergencyFund || {}) },
     investmentCapital: { ...INIT.investmentCapital, ...(parsed.investmentCapital || {}) },
     travelFund: { ...INIT.travelFund, ...(parsed.travelFund || {}) },
@@ -723,6 +741,7 @@ const INIT: AppState = {
   finance: { cash: 0, receivable: 0, totalDebt: 0, monthlyExpense: 0 },
   financeAdjustments: [],
   monthlyGoal: { target: 0 }, quarterlyGoal: { target: 0 },
+  commissions: [], goalAdjustments: [],
   stageNames: ["Estabilización", "Recuperación", "Expansión"],
   currency: "MXN",
   habitConfigs: DEFAULT_HABITS, habitLogs: [],
@@ -1057,6 +1076,658 @@ function HabitTracker({ s, set }: { s: AppState; set: (x: AppState) => void }) {
   );
 }
 
+// ─── Metas del Mes/Trimestre + Comisiones con abonos parciales ────────────────
+// Goal Assistant 90 · dashboard HOY (2 tarjetas de meta) y área Metas (configuración
+// de metas + comisiones con abonos parciales).
+// Reglas de datos permanentes:
+//  * SOLO las comisiones TOTALMENTE liquidadas (🟢) suman al progreso de la meta.
+//  * Nada se borra: los abonos se anulan con auditoría (voided + voidedAt) y una
+//    comisión con historial de abonos nunca se elimina.
+//  * El monto vigente vive en monthlyGoal/quarterlyGoal (una sola fuente de verdad);
+//    cada reajuste queda además en la bitácora goalAdjustments (append-only).
+
+type ToastTone = "ok" | "warn" | "error";
+interface ToastMsg { id: string; text: string; tone: ToastTone; }
+
+/** Avisos efímeros sin dependencias externas. */
+function useToast() {
+  const [toast, setToast] = useState<ToastMsg | null>(null);
+  const timer = useRef<number | null>(null);
+  const dismiss = () => setToast(null);
+  const notify = (text: string, tone: ToastTone = "ok") => {
+    setToast({ id: makeId("toast"), text, tone });
+    if (timer.current) window.clearTimeout(timer.current);
+    timer.current = window.setTimeout(() => setToast(null), 3800);
+  };
+  useEffect(() => () => { if (timer.current) window.clearTimeout(timer.current); }, []);
+  return { toast, notify, dismiss };
+}
+
+function Toast({ toast, onClose }: { toast: ToastMsg | null; onClose: () => void }) {
+  if (!toast) return null;
+  const tones: Record<ToastTone, string> = {
+    ok: "border-emerald-500/40 bg-emerald-500/10 text-emerald-200",
+    warn: "border-amber-500/40 bg-amber-500/10 text-amber-200",
+    error: "border-red-500/40 bg-red-500/10 text-red-300",
+  };
+  return (
+    <div role="status" aria-live="polite" className={`ga-toast fixed bottom-24 lg:bottom-8 left-1/2 -translate-x-1/2 z-[70] flex items-center gap-3 px-4 py-3 rounded-xl border shadow-2xl max-w-[92vw] ${tones[toast.tone]}`}>
+      <span className="text-sm font-medium">{toast.text}</span>
+      <button onClick={onClose} aria-label="Cerrar aviso" className="opacity-70 hover:opacity-100"><X size={14} /></button>
+    </div>
+  );
+}
+
+/** Confirmación explícita antes de cualquier acción irreversible. */
+function ConfirmDialog({ title, message, confirmLabel, onConfirm, onCancel }: { title: string; message: string; confirmLabel: string; onConfirm: () => void; onCancel: () => void }) {
+  return (
+    <div className="fixed inset-0 z-[75] bg-black/70 flex items-center justify-center p-4" onClick={onCancel}>
+      <div className="bg-[#16161F] border border-white/10 rounded-2xl p-5 w-full max-w-sm shadow-2xl" onClick={e => e.stopPropagation()}>
+        <p className="text-white font-semibold mb-2">{title}</p>
+        <p className="text-sm text-gray-400 mb-4">{message}</p>
+        <div className="flex gap-2 justify-end">
+          <button onClick={onCancel} className="min-h-11 px-4 bg-white/5 text-gray-300 rounded-xl text-sm font-medium hover:bg-white/10">Cancelar</button>
+          <button onClick={onConfirm} className="min-h-11 px-4 bg-amber-500 text-black rounded-xl text-sm font-semibold hover:bg-amber-400">{confirmLabel}</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function bandBadgeColor(percentage: number): BColor {
+  if (percentage <= 25) return "red";
+  if (percentage <= 50) return "orange";
+  if (percentage <= 75) return "yellow";
+  return "green";
+}
+
+/** Frase motivacional dinámica (fuente única: lib/commissions). */
+function MotivationalMessage({ progress, className = "" }: { progress: GoalProgress; className?: string }) {
+  return (
+    <p className={`text-[11px] leading-relaxed ${progress.achieved ? "text-emerald-300" : "text-gray-500"} ${className}`}>
+      {motivationalMessage(progress.percentage, progress.achieved)}
+    </p>
+  );
+}
+
+/** Tarjeta de meta del mes 🌙 o del trimestre 📅 (barra con color dinámico). */
+function GoalCard({ progress, title, emoji, currency, onEdit, onGoTo, celebrate }: {
+  progress: GoalProgress; title: string; emoji: string; currency: Currency;
+  onEdit: () => void; onGoTo: () => void; celebrate?: boolean;
+}) {
+  const { period, target, current, percentage, remaining, hasTarget, achieved, color, bandLabel, inProcessAmount, inProcessCount, pendingCount, settledCount } = progress;
+  return (
+    <Card className={`relative overflow-hidden ${achieved ? "border-emerald-500/30" : ""}`}>
+      {celebrate && achieved && <div className="ga-celebrate absolute inset-0 pointer-events-none rounded-2xl" aria-hidden="true" />}
+      <div className="relative">
+        <div className="flex items-start justify-between gap-2">
+          <div className="flex items-center gap-2.5 min-w-0">
+            <span className="text-3xl leading-none" aria-hidden="true">{emoji}</span>
+            <div className="min-w-0">
+              <p className="text-sm font-bold text-white truncate">{title}</p>
+              <p className="text-[11px] text-gray-500">{period.label}</p>
+            </div>
+          </div>
+          <button onClick={onEdit} aria-label={`Editar ${title}`} title="Editar meta" className="shrink-0 w-11 h-11 inline-flex items-center justify-center rounded-xl text-gray-400 hover:text-white hover:bg-white/10 transition-all">
+            <Pencil size={15} />
+          </button>
+        </div>
+
+        {hasTarget ? (
+          <>
+            <p className="text-3xl font-black mt-3" style={{ color }}>{fmt(current, currency)}</p>
+            <p className="text-xs text-gray-500">de {fmt(target, currency)} · falta {fmt(remaining, currency)}</p>
+            <div className="mt-3"><BarFill value={current} max={target} color={color} h={12} /></div>
+            <div className="flex items-center justify-between mt-2 gap-2">
+              <Bdg color={bandBadgeColor(percentage)}>{bandLabel}</Bdg>
+              <span className="text-lg font-black" style={{ color }}>{percentage}%</span>
+            </div>
+
+            <div className="mt-3 space-y-1">
+              {inProcessCount > 0 && (
+                <p className="text-[11px] text-amber-300/90">🟡 {fmt(inProcessAmount, currency)} abonado en {inProcessCount} {inProcessCount === 1 ? "comisión" : "comisiones"} · aún no cuenta para la meta</p>
+              )}
+              {pendingCount > 0 && (
+                <p className="text-[11px] text-red-300/80">🔴 {pendingCount} {pendingCount === 1 ? "comisión pendiente" : "comisiones pendientes"} de abono</p>
+              )}
+              {inProcessCount === 0 && pendingCount === 0 && (
+                <p className="text-[11px] text-gray-600">🟢 {settledCount} {settledCount === 1 ? "comisión liquidada" : "comisiones liquidadas"} en el período</p>
+              )}
+            </div>
+
+            <div className="mt-3 flex items-end justify-between gap-3">
+              <MotivationalMessage progress={progress} className="flex-1" />
+              <button onClick={onGoTo} className="shrink-0 text-[11px] text-[#c084fc] hover:underline font-medium">Gestionar →</button>
+            </div>
+
+            {achieved && (
+              <div className="mt-3 rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-3 py-2">
+                <p className="text-xs font-bold text-emerald-300">🎉 ¡Meta alcanzada! Lo que sigas liquidando es ganancia sobre el objetivo.</p>
+              </div>
+            )}
+          </>
+        ) : (
+          <div className="mt-3">
+            <p className="text-sm text-gray-400">Sin meta definida para este período.</p>
+            <p className="text-[11px] text-gray-600 mt-1">Define el monto objetivo y el avance se medirá con tus comisiones liquidadas.</p>
+            {inProcessAmount > 0 && <p className="text-[11px] text-amber-300/90 mt-2">🟡 {fmt(inProcessAmount, currency)} ya abonado, esperando una meta definida.</p>}
+            <div className="mt-3 flex flex-wrap gap-2">
+              <button onClick={onEdit} className="min-h-11 px-4 rounded-xl bg-[#9D4EDD] text-white text-sm font-semibold hover:bg-[#7B2CBF]">Definir meta</button>
+              <button onClick={onGoTo} className="min-h-11 px-4 rounded-xl bg-white/5 text-gray-300 text-sm font-medium hover:bg-white/10">Ver comisiones</button>
+            </div>
+          </div>
+        )}
+      </div>
+    </Card>
+  );
+}
+
+/** Editor de meta (mes o trimestre) con historial de reajustes. */
+function GoalEditor({ type, currentTarget, adjustments, currency, onSave, onClose }: {
+  type: GoalTargetType; currentTarget: number; adjustments: GoalAdjustment[]; currency: Currency;
+  onSave: (amount: number, note: string) => void; onClose: () => void;
+}) {
+  const [amount, setAmount] = useState(currentTarget > 0 ? String(currentTarget) : "");
+  const [note, setNote] = useState("");
+  const [err, setErr] = useState<string | null>(null);
+  const isMonthly = type === "monthly";
+  const period = periodFor(type, todayLocal());
+  const log = adjustmentsOf(adjustments, type).slice(0, 6);
+  const save = () => {
+    if (amount.trim() === "") { setErr("Escribe el monto de la meta."); return; }
+    const n = Number(amount);
+    if (!Number.isFinite(n) || n < 0) { setErr("El monto debe ser 0 o mayor."); return; }
+    onSave(round2(n), note);
+  };
+  return (
+    <div className="fixed inset-0 z-[75] bg-black/70 flex items-center justify-center p-4 overflow-y-auto" onClick={onClose}>
+      <div className="bg-[#16161F] border border-white/10 rounded-2xl p-5 w-full max-w-md shadow-2xl my-auto" onClick={e => e.stopPropagation()}>
+        <div className="flex items-start justify-between gap-3 mb-4">
+          <div>
+            <p className="text-white font-bold">{isMonthly ? "Meta del Mes 🌙" : "Meta Trimestral 📅"}</p>
+            <p className="text-[11px] text-gray-500">{period.label}</p>
+          </div>
+          <button onClick={onClose} aria-label="Cerrar" className="w-11 h-11 inline-flex items-center justify-center rounded-xl text-gray-500 hover:text-white hover:bg-white/10"><X size={16} /></button>
+        </div>
+
+        <label className="text-xs text-gray-500 block mb-1.5">Monto objetivo ({currency})</label>
+        <input type="number" inputMode="decimal" min="0" value={amount} autoFocus onChange={e => { setAmount(e.target.value); setErr(null); }}
+          className="w-full bg-[#0D0D12] border border-white/10 text-white rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:border-[#9D4EDD]/60" />
+        <p className="text-[11px] text-gray-600 mt-1">Meta vigente: {fmt(currentTarget, currency)} · el avance solo cuenta con comisiones liquidadas 🟢.</p>
+
+        <label className="text-xs text-gray-500 block mt-3 mb-1.5">Motivo del reajuste (opcional)</label>
+        <input value={note} onChange={e => setNote(e.target.value)} placeholder="Ej. Nuevo cliente / ajuste de temporada"
+          className="w-full bg-[#0D0D12] border border-white/10 text-white rounded-xl px-3 py-2.5 text-sm placeholder-gray-700 focus:outline-none focus:border-[#9D4EDD]/60" />
+
+        {err && <p className="text-[11px] text-red-400 mt-2">{err}</p>}
+
+        {log.length > 0 && (
+          <div className="mt-4">
+            <p className="text-[11px] text-gray-500 uppercase tracking-wider mb-2">Historial de reajustes</p>
+            <div className="space-y-1.5 max-h-44 overflow-y-auto pr-1">
+              {log.map(a => (
+                <div key={a.id} className="rounded-xl bg-[#0D0D12] border border-white/5 px-3 py-2">
+                  <p className="text-[11px] text-gray-300">{fmt(a.from, currency)} → <span className="text-white font-semibold">{fmt(a.to, currency)}</span></p>
+                  <p className="text-[10px] text-gray-600">{a.at.slice(0, 10)} · {a.periodKey}{a.note ? ` · ${a.note}` : ""}</p>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        <div className="flex gap-2 mt-5">
+          <button onClick={save} className="flex-1 min-h-11 rounded-xl bg-[#9D4EDD] text-white text-sm font-semibold hover:bg-[#7B2CBF]">Guardar meta</button>
+          <button onClick={onClose} className="flex-1 min-h-11 rounded-xl bg-white/5 text-gray-300 text-sm font-medium hover:bg-white/10">Cancelar</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** Registro de un abono parcial sobre una comisión. */
+function PaymentForm({ commission, currency, onSubmit, onCancel }: {
+  commission: Commission; currency: Currency;
+  onSubmit: (payment: CommissionPayment) => void; onCancel: () => void;
+}) {
+  const [amount, setAmount] = useState("");
+  const [date, setDate] = useState(todayLocal());
+  const [note, setNote] = useState("");
+  const [err, setErr] = useState<string | null>(null);
+  const pendiente = remainingOf(commission);
+  const submit = () => {
+    const e = validatePaymentInput(commission, Number(amount), date);
+    if (e) { setErr(e); return; }
+    onSubmit(createPayment({ amount: Number(amount), date, note }));
+  };
+  return (
+    <div className="mt-3 rounded-xl bg-[#0D0D12] border border-[#9D4EDD]/25 p-3.5 space-y-3">
+      <div className="flex items-center justify-between gap-2">
+        <p className="text-xs font-semibold text-white">Nuevo abono</p>
+        <button onClick={() => { setAmount(String(pendiente)); setErr(null); }} className="text-[11px] text-[#c084fc] hover:underline">Liquidar saldo ({fmt(pendiente, currency)})</button>
+      </div>
+      <div className="grid grid-cols-2 gap-2">
+        <div>
+          <label className="text-[11px] text-gray-600 block mb-1">Monto ({currency})</label>
+          <input type="number" inputMode="decimal" value={amount} autoFocus onChange={e => { setAmount(e.target.value); setErr(null); }}
+            className="w-full bg-[#16161F] border border-white/10 text-white rounded-xl px-2.5 py-2 text-xs focus:outline-none focus:border-[#9D4EDD]/60" />
+        </div>
+        <div>
+          <label className="text-[11px] text-gray-600 block mb-1">Fecha</label>
+          <input type="date" value={date} onChange={e => { setDate(e.target.value); setErr(null); }}
+            className="w-full bg-[#16161F] border border-white/10 text-white rounded-xl px-2.5 py-2 text-xs focus:outline-none focus:border-[#9D4EDD]/60" />
+        </div>
+      </div>
+      <input value={note} onChange={e => setNote(e.target.value)} placeholder="Nota (opcional)"
+        className="w-full bg-[#16161F] border border-white/10 text-white rounded-xl px-2.5 py-2 text-xs placeholder-gray-700 focus:outline-none focus:border-[#9D4EDD]/60" />
+      <p className="text-[11px] text-gray-500">Saldo pendiente: <span className="text-white font-semibold">{fmt(pendiente, currency)}</span> · al completar el total la comisión pasa a 🟢 y suma a tu meta.</p>
+      {err && <p className="text-[11px] text-red-400">{err}</p>}
+      <div className="flex gap-2">
+        <button onClick={submit} className="flex-1 min-h-11 rounded-xl bg-[#9D4EDD] text-white text-xs font-semibold hover:bg-[#7B2CBF]">Registrar abono</button>
+        <button onClick={onCancel} className="flex-1 min-h-11 rounded-xl bg-white/5 text-gray-300 text-xs font-medium hover:bg-white/10">Cancelar</button>
+      </div>
+    </div>
+  );
+}
+
+/** Alta de una comisión (con mes objetivo al que sumará). */
+function CommissionForm({ currency, defaultMonth, onSubmit, onCancel }: {
+  currency: Currency; defaultMonth: string;
+  onSubmit: (c: Commission) => void; onCancel: () => void;
+}) {
+  const [description, setDescription] = useState("");
+  const [amount, setAmount] = useState("");
+  const [date, setDate] = useState(todayLocal());
+  const [goalMonth, setGoalMonth] = useState(defaultMonth || todayLocal().slice(0, 7));
+  const [err, setErr] = useState<string | null>(null);
+  const submit = () => {
+    const e = validateCommissionInput(description, Number(amount), date);
+    if (e) { setErr(e); return; }
+    if (!normalizeMonth(goalMonth)) { setErr("Selecciona el mes al que suma esta comisión."); return; }
+    onSubmit(createCommission({ description, totalAmount: Number(amount), commissionDate: date, goalMonth }));
+  };
+  return (
+    <div className="bg-[#0D0D12] rounded-xl p-4 border border-white/8 mb-4 space-y-3">
+      <input value={description} onChange={e => { setDescription(e.target.value); setErr(null); }} placeholder="Descripción (ej. Comisión cliente X)" autoFocus
+        className="w-full bg-[#16161F] border border-white/10 text-white rounded-xl px-3 py-2.5 text-sm placeholder-gray-700 focus:outline-none focus:border-[#9D4EDD]/60" />
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+        <div>
+          <label className="text-[11px] text-gray-600 block mb-1">Monto total ({currency})</label>
+          <input type="number" inputMode="decimal" value={amount} onChange={e => { setAmount(e.target.value); setErr(null); }}
+            className="w-full bg-[#16161F] border border-white/10 text-white rounded-xl px-3 py-2 text-sm focus:outline-none focus:border-[#9D4EDD]/60" />
+        </div>
+        <div>
+          <label className="text-[11px] text-gray-600 block mb-1">Fecha de la comisión</label>
+          <input type="date" value={date} onChange={e => { setDate(e.target.value); setErr(null); }}
+            className="w-full bg-[#16161F] border border-white/10 text-white rounded-xl px-3 py-2 text-sm focus:outline-none focus:border-[#9D4EDD]/60" />
+        </div>
+        <div>
+          <label className="text-[11px] text-gray-600 block mb-1">Suma al mes</label>
+          <input type="month" value={goalMonth} onChange={e => { setGoalMonth(e.target.value); setErr(null); }}
+            className="w-full bg-[#16161F] border border-white/10 text-white rounded-xl px-3 py-2 text-sm focus:outline-none focus:border-[#9D4EDD]/60" />
+        </div>
+      </div>
+      <p className="text-[11px] text-gray-500">💡 La comisión empieza en 🔴 pendiente y solo sumará a tu meta cuando esté 100% liquidada (🟢).</p>
+      {err && <p className="text-[11px] text-red-400">{err}</p>}
+      <div className="flex gap-2">
+        <button onClick={submit} className="min-h-11 px-4 rounded-xl bg-[#9D4EDD] text-white text-sm font-semibold hover:bg-[#7B2CBF]">Guardar comisión</button>
+        <button onClick={onCancel} className="min-h-11 px-4 rounded-xl bg-white/5 text-gray-300 text-sm font-medium hover:bg-white/10">Cancelar</button>
+      </div>
+    </div>
+  );
+}
+
+/** Comisión individual: estado, abonos, anulación auditada y borrado seguro. */
+function CommissionCard({ commission, currency, expanded, onToggle, onAddPayment, onVoidPayment, onDelete }: {
+  commission: Commission; currency: Currency; expanded: boolean;
+  onToggle: () => void;
+  onAddPayment: (payment: CommissionPayment) => void;
+  onVoidPayment: (paymentId: string) => void;
+  onDelete: () => void;
+}) {
+  const [confirmVoid, setConfirmVoid] = useState<CommissionPayment | null>(null);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const v = commissionView(commission);
+  const meta = COMMISSION_STATUS_META[v.status];
+  const goalMonth = effectiveGoalMonth(commission);
+  const qLabel = goalMonth ? quarterLabelEs(Number(goalMonth.slice(0, 4)), quarterOfMonth(goalMonth)) : "—";
+  const payments = (commission.payments || []).slice().sort((a, b) => String(b.date || "").localeCompare(String(a.date || "")));
+  const border = v.status === "paid" ? "border-emerald-500/25" : v.status === "partial" ? "border-amber-500/25" : "border-white/8";
+  return (
+    <div className={`rounded-xl border bg-[#16161F] p-4 ${border}`}>
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-2 flex-wrap">
+            <span className="text-base leading-none" aria-hidden="true">{meta.emoji}</span>
+            <p className="text-sm font-semibold text-white break-words">{commission.description}</p>
+            <Bdg color={meta.badge}>{meta.label}</Bdg>
+          </div>
+          <p className="text-[11px] text-gray-500 mt-1">
+            Suma a <span className="text-gray-300 font-medium">{monthLabelEs(goalMonth)}</span> · {qLabel} · comisión del {commission.commissionDate || "—"}
+          </p>
+        </div>
+        <div className="text-right shrink-0">
+          <p className="text-sm font-bold text-white">{fmt(v.total, currency)}</p>
+          <p className="text-[11px] text-gray-500">abonado {fmt(v.paid, currency)}</p>
+        </div>
+      </div>
+
+      <div className="mt-3"><BarFill value={v.paid} max={v.total || 1} color={meta.color} h={7} /></div>
+      <div className="flex items-center justify-between mt-1.5 gap-2 text-[11px]">
+        <span className="text-gray-500">{v.percentage}% · falta {fmt(v.remaining, currency)}</span>
+        {v.status === "paid"
+          ? <span className="text-emerald-400">Liquidada{v.settledAt ? ` el ${v.settledAt}` : ""} ✓</span>
+          : <span className="text-amber-300/90">{v.status === "partial" ? "En proceso · aún no suma a la meta" : "Pendiente de abono"}</span>}
+      </div>
+
+      <div className="flex items-center gap-2 mt-3 flex-wrap">
+        <button onClick={onToggle} className="min-h-11 px-3 rounded-xl bg-[#9D4EDD]/15 border border-[#9D4EDD]/25 text-[#c084fc] text-xs font-medium hover:bg-[#9D4EDD]/25">
+          {expanded ? "Ocultar abonos" : `Abonos (${v.paymentCount})`}
+        </button>
+        {v.status !== "paid" && !expanded && (
+          <button onClick={onToggle} className="min-h-11 px-3 rounded-xl bg-emerald-500/15 border border-emerald-500/25 text-emerald-300 text-xs font-medium hover:bg-emerald-500/25">💰 Nuevo abono</button>
+        )}
+        {canDeleteCommission(commission) && (
+          <button onClick={() => setConfirmDelete(true)} className="min-h-11 px-3 rounded-xl bg-white/5 text-gray-400 text-xs font-medium hover:bg-red-500/10 hover:text-red-300 inline-flex items-center gap-1">
+            <Trash2 size={12} /> Eliminar
+          </button>
+        )}
+      </div>
+
+      {expanded && (
+        <div className="mt-3 space-y-2">
+          {v.status !== "paid" && <PaymentForm commission={commission} currency={currency} onSubmit={onAddPayment} onCancel={onToggle} />}
+          {payments.length > 0 ? (
+            <div className="space-y-1.5">
+              <p className="text-[11px] text-gray-500 uppercase tracking-wider">Abonos ({v.paymentCount} activos · {v.voidedCount} anulados)</p>
+              {payments.map(p => (
+                <div key={p.id} className={`flex items-center justify-between gap-2 rounded-xl border px-3 py-2 ${p.voided ? "border-white/5 bg-[#0D0D12] opacity-60" : "border-white/8 bg-[#0D0D12]"}`}>
+                  <div className="min-w-0">
+                    <p className={`text-xs ${p.voided ? "text-gray-500 line-through" : "text-white font-medium"}`}>{fmt(p.amount, currency)} · {p.date}</p>
+                    <p className="text-[10px] text-gray-600 truncate">
+                      {p.voided ? `Anulado el ${String(p.voidedAt || "").slice(0, 10)} · se conserva en el historial` : (p.note || "Sin nota")}
+                    </p>
+                  </div>
+                  {!p.voided && (
+                    <button onClick={() => setConfirmVoid(p)} className="shrink-0 min-h-11 px-3 rounded-xl bg-white/5 text-gray-400 text-[11px] font-medium hover:bg-white/10">Anular</button>
+                  )}
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className="text-[11px] text-gray-600 italic">Sin abonos registrados: esta comisión no suma a la meta hasta estar 100% liquidada.</p>
+          )}
+        </div>
+      )}
+
+      {confirmVoid && (
+        <ConfirmDialog
+          title="Anular abono"
+          message={`Se anularán ${fmt(confirmVoid.amount, currency)} del ${confirmVoid.date}. El registro no se elimina físicamente: queda en el historial marcado como anulado.`}
+          confirmLabel="Sí, anular"
+          onConfirm={() => { onVoidPayment(confirmVoid.id); setConfirmVoid(null); }}
+          onCancel={() => setConfirmVoid(null)}
+        />
+      )}
+      {confirmDelete && (
+        <ConfirmDialog
+          title="Eliminar comisión"
+          message="Esta comisión no tiene abonos registrados, por lo que puede eliminarse. Las comisiones con historial de abonos nunca se borran."
+          confirmLabel="Eliminar"
+          onConfirm={() => { setConfirmDelete(false); onDelete(); }}
+          onCancel={() => setConfirmDelete(false)}
+        />
+      )}
+    </div>
+  );
+}
+
+/** Sección B · Comisiones y Abonos 💸 (solo las liquidadas suman a las metas). */
+function CommissionsSection({ s, set, currency, notify }: {
+  s: AppState; set: (x: AppState) => void; currency: Currency; notify: (text: string, tone?: ToastTone) => void;
+}) {
+  const commissions = s.commissions ?? [];
+  const todayStr = todayLocal();
+  const [showForm, setShowForm] = useState(false);
+  const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [filterStatus, setFilterStatus] = useState<"all" | CommissionStatus>("all");
+  const [filterMonth, setFilterMonth] = useState("all");
+
+  const resumen = periodSummary(commissions, "monthly", todayStr);
+  const mesActual = todayStr.slice(0, 7);
+  const meses = recentPeriods("monthly", todayStr, 6).map(p => p.key);
+  const filtered = sortCommissions(commissions.filter(c => {
+    if (filterStatus !== "all" && statusOf(c) !== filterStatus) return false;
+    if (filterMonth !== "all" && effectiveGoalMonth(c) !== filterMonth) return false;
+    return true;
+  }));
+
+  const agregar = (c: Commission) => {
+    set({ ...s, commissions: addCommission(commissions, c) });
+    setShowForm(false);
+    setExpandedId(c.id);
+    notify(`💸 Comisión "${c.description}" registrada. Sumará a tu meta al liquidarse 🟢`);
+  };
+  const registrarAbono = (id: string, payment: CommissionPayment) => {
+    const next = addPayment(commissions, id, payment);
+    set({ ...s, commissions: next });
+    const c = next.find(x => x.id === id);
+    if (c && statusOf(c) === "paid") notify("🟢 ¡Comisión liquidada! Ya cuenta para tu meta.");
+    else notify("🟡 Abono registrado. La comisión sigue en proceso: aún no suma a la meta.", "warn");
+  };
+  const anularAbono = (id: string, paymentId: string) => {
+    set({ ...s, commissions: voidPayment(commissions, id, paymentId) });
+    notify("Abono anulado: el registro se conserva en el historial.", "warn");
+  };
+  const eliminar = (id: string) => {
+    set({ ...s, commissions: removeCommissionIfEmpty(commissions, id) });
+    notify("Comisión eliminada (no tenía abonos registrados).");
+  };
+
+  const chips: { id: "all" | CommissionStatus; label: string }[] = [
+    { id: "all", label: `Todas (${commissions.length})` },
+    { id: "partial", label: "🟡 En proceso" },
+    { id: "pending", label: "🔴 Pendientes" },
+    { id: "paid", label: "🟢 Liquidadas" },
+  ];
+
+  return (
+    <Card>
+      <div className="flex items-start justify-between gap-3 mb-3">
+        <div className="min-w-0">
+          <p className="text-xs text-gray-500 uppercase tracking-wider">Comisiones y Abonos 💸</p>
+          <p className="text-[11px] text-gray-600 mt-1">Solo las comisiones liquidadas 🟢 suman a tus metas. Los abonos parciales quedan en proceso 🟡.</p>
+        </div>
+        <button onClick={() => setShowForm(!showForm)} className="shrink-0 min-h-11 px-3 rounded-xl bg-[#9D4EDD] text-white text-xs font-semibold hover:bg-[#7B2CBF] inline-flex items-center gap-1.5">
+          <Plus size={13} /> Nueva comisión
+        </button>
+      </div>
+
+      <div className="grid grid-cols-3 gap-2 mb-4">
+        <div className="rounded-xl bg-[#0D0D12] border border-emerald-500/20 p-3">
+          <p className="text-[10px] text-gray-500 uppercase tracking-wider">🟢 Cuenta a la meta</p>
+          <p className="text-lg font-black text-emerald-400">{fmt(resumen.settled, currency)}</p>
+          <p className="text-[10px] text-gray-600">este mes ({monthLabelEs(mesActual)})</p>
+        </div>
+        <div className="rounded-xl bg-[#0D0D12] border border-amber-500/20 p-3">
+          <p className="text-[10px] text-gray-500 uppercase tracking-wider">🟡 En proceso</p>
+          <p className="text-lg font-black text-amber-400">{fmt(resumen.inProcess, currency)}</p>
+          <p className="text-[10px] text-gray-600">abonado, aún no cuenta</p>
+        </div>
+        <div className="rounded-xl bg-[#0D0D12] border border-red-500/20 p-3">
+          <p className="text-[10px] text-gray-500 uppercase tracking-wider">🔴 Pendiente</p>
+          <p className="text-lg font-black text-red-400">{fmt(resumen.pending, currency)}</p>
+          <p className="text-[10px] text-gray-600">{resumen.count} comisiones del mes</p>
+        </div>
+      </div>
+
+      {showForm && <CommissionForm currency={currency} defaultMonth={mesActual} onSubmit={agregar} onCancel={() => setShowForm(false)} />}
+
+      {commissions.length > 0 && (
+        <div className="flex flex-wrap items-center gap-2 mb-4">
+          {chips.map(ch => (
+            <button key={ch.id} onClick={() => setFilterStatus(ch.id)}
+              className={`min-h-11 px-3 rounded-xl text-[11px] font-medium border transition-all ${filterStatus === ch.id ? "bg-[#9D4EDD]/15 border-[#9D4EDD]/30 text-[#c084fc]" : "bg-white/5 border-white/10 text-gray-400 hover:text-gray-200"}`}>
+              {ch.label}
+            </button>
+          ))}
+          <select value={filterMonth} onChange={e => setFilterMonth(e.target.value)}
+            className="min-h-11 bg-[#0D0D12] border border-white/10 text-gray-300 rounded-xl px-3 text-[11px] focus:outline-none">
+            <option value="all">Todos los meses objetivo</option>
+            {meses.map(m => <option key={m} value={m}>{monthLabelEs(m)}</option>)}
+          </select>
+        </div>
+      )}
+
+      {filtered.length === 0 ? (
+        <div className="text-center py-6">
+          <p className="text-sm text-gray-500">Sin comisiones registradas.</p>
+          <p className="text-[11px] text-gray-600 mt-1">Registra tu primera comisión: se sumará a la meta cuando esté 100% liquidada.</p>
+        </div>
+      ) : (
+        <div className="space-y-3">
+          {filtered.map(c => (
+            <CommissionCard
+              key={c.id}
+              commission={c}
+              currency={currency}
+              expanded={expandedId === c.id}
+              onToggle={() => setExpandedId(expandedId === c.id ? null : c.id)}
+              onAddPayment={p => registrarAbono(c.id, p)}
+              onVoidPayment={pid => anularAbono(c.id, pid)}
+              onDelete={() => eliminar(c.id)}
+            />
+          ))}
+        </div>
+      )}
+    </Card>
+  );
+}
+
+/** Sección A · Configuración de Metas ⚙️ (meta del mes y del trimestre + historial). */
+function GoalsConfigSection({ s, set, currency, notify, hideAmounts, onToggleHide }: {
+  s: AppState; set: (x: AppState) => void; currency: Currency;
+  notify: (text: string, tone?: ToastTone) => void; hideAmounts: boolean; onToggleHide: () => void;
+}) {
+  const commissions = s.commissions ?? [];
+  const adjustments = s.goalAdjustments ?? [];
+  const todayStr = todayLocal();
+  const [editing, setEditing] = useState<GoalTargetType | null>(null);
+  const monthly = getGoalProgressData(commissions, s.monthlyGoal.target, "monthly", todayStr);
+  const quarterly = getGoalProgressData(commissions, s.quarterlyGoal.target, "quarterly", todayStr);
+
+  const saveTarget = (type: GoalTargetType, amount: number, note: string) => {
+    const current = type === "monthly" ? s.monthlyGoal.target : s.quarterlyGoal.target;
+    if (round2(amount) === round2(current)) {
+      notify("El monto no cambió: no se registró ningún reajuste.", "warn");
+      setEditing(null);
+      return;
+    }
+    const out = applyGoalTarget({ monthlyGoal: s.monthlyGoal, quarterlyGoal: s.quarterlyGoal, goalAdjustments: adjustments }, type, amount, todayStr, note);
+    set({ ...s, monthlyGoal: out.monthlyGoal, quarterlyGoal: out.quarterlyGoal, goalAdjustments: out.goalAdjustments });
+    setEditing(null);
+    notify(type === "monthly" ? "🌙 Meta del mes actualizada." : "📅 Meta trimestral actualizada.");
+  };
+
+  const pane = (type: GoalTargetType, progress: GoalProgress, title: string, emoji: string) => {
+    const rows = recentPeriods(type, todayStr, 4).map(p => {
+      const inPeriod = commissionsInPeriod(commissions, p);
+      const settled = settledTotalOf(inPeriod);
+      const target = targetForPeriod(adjustments, type, progress.target, p.key);
+      return {
+        key: p.key, label: p.label, target, settled,
+        pctv: target > 0 ? Math.min(100, Math.round((settled / target) * 100)) : 0,
+        isCurrent: p.key === progress.period.key,
+      };
+    });
+    const log = adjustmentsOf(adjustments, type).slice(0, 3);
+    return (
+      <div className="rounded-xl bg-[#0D0D12] border border-white/5 p-4">
+        <div className="flex items-start justify-between gap-2">
+          <div className="flex items-center gap-2 min-w-0">
+            <span className="text-xl leading-none" aria-hidden="true">{emoji}</span>
+            <div className="min-w-0">
+              <p className="text-sm font-bold text-white">{title}</p>
+              <p className="text-[11px] text-gray-500">{progress.period.label}</p>
+            </div>
+          </div>
+          <button onClick={() => setEditing(type)} className="shrink-0 min-h-11 px-3 rounded-xl bg-[#9D4EDD]/15 border border-[#9D4EDD]/25 text-[#c084fc] text-[11px] font-medium hover:bg-[#9D4EDD]/25 inline-flex items-center gap-1.5">
+            <Pencil size={12} /> Editar
+          </button>
+        </div>
+
+        <div className="mt-3 flex items-end justify-between gap-2">
+          <div>
+            <p className="text-[11px] text-gray-500">Meta vigente</p>
+            <p className="text-2xl font-black text-white">{fmt(progress.target, currency)}</p>
+          </div>
+          <div className="text-right">
+            <p className="text-[11px] text-gray-500">Liquidado</p>
+            <p className="text-2xl font-black" style={{ color: progress.color }}>{fmt(progress.current, currency)}</p>
+          </div>
+        </div>
+        <div className="mt-2"><BarFill value={progress.current} max={progress.target || 1} color={progress.color} h={9} /></div>
+        <div className="flex items-center justify-between mt-2 gap-2">
+          <Bdg color={bandBadgeColor(progress.percentage)}>{progress.bandLabel}</Bdg>
+          <span className="text-sm font-black" style={{ color: progress.color }}>{progress.percentage}%</span>
+        </div>
+        <p className="text-[11px] text-gray-500 mt-2">Falta {fmt(progress.remaining, currency)} · {progress.settledCount} liquidada(s), {progress.inProcessCount} en proceso, {progress.pendingCount} pendiente(s).</p>
+        <MotivationalMessage progress={progress} className="mt-2" />
+
+        <div className="mt-4">
+          <p className="text-[11px] text-gray-500 uppercase tracking-wider mb-2">Meta por período</p>
+          <div className="space-y-1">
+            {rows.map(r => (
+              <div key={r.key} className={`flex items-center justify-between gap-2 rounded-lg px-2.5 py-2 ${r.isCurrent ? "bg-[#9D4EDD]/10 border border-[#9D4EDD]/20" : "bg-[#16161F] border border-white/5"}`}>
+                <span className={`text-[11px] ${r.isCurrent ? "text-[#c084fc] font-semibold" : "text-gray-400"} truncate`}>{r.label}</span>
+                <span className="text-[11px] text-gray-500 shrink-0">{fmt(r.settled, currency)} / {fmt(r.target, currency)} · <span className="text-gray-300 font-semibold">{r.pctv}%</span></span>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {log.length > 0 && (
+          <div className="mt-4">
+            <p className="text-[11px] text-gray-500 uppercase tracking-wider mb-2">Últimos reajustes de meta</p>
+            <div className="space-y-1">
+              {log.map(a => (
+                <p key={a.id} className="text-[11px] text-gray-500">
+                  <span className="text-gray-400">{fmt(a.from, currency)} → {fmt(a.to, currency)}</span> · {a.at.slice(0, 10)} · {a.periodKey}{a.note ? ` · ${a.note}` : ""}
+                </p>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  return (
+    <Card>
+      <div className="flex items-start justify-between gap-3 mb-3">
+        <div className="min-w-0">
+          <p className="text-xs text-gray-500 uppercase tracking-wider">Configuración de Metas ⚙️</p>
+          <p className="text-[11px] text-gray-600 mt-1">Define cuánto quieres lograr este mes y este trimestre. Cada cambio queda registrado en la bitácora.</p>
+        </div>
+        <EyeToggle hidden={hideAmounts} onToggle={onToggleHide} />
+      </div>
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        {pane("monthly", monthly, "Meta del Mes", "🌙")}
+        {pane("quarterly", quarterly, "Meta Trimestral", "📅")}
+      </div>
+      {editing && (
+        <GoalEditor
+          type={editing}
+          currentTarget={editing === "monthly" ? s.monthlyGoal.target : s.quarterlyGoal.target}
+          adjustments={adjustments}
+          currency={currency}
+          onSave={(amount, note) => saveTarget(editing, amount, note)}
+          onClose={() => setEditing(null)}
+        />
+      )}
+    </Card>
+  );
+}
+
 // ─── Hoy Tab (Goal Assistant 90 · pantalla inicial de ejecución personal) ────
 
 function HoyTab({ s, set, onGoTo }: { s: AppState; set: (x: AppState) => void; onGoTo: (t: AppTab) => void }) {
@@ -1102,6 +1773,50 @@ function HoyTab({ s, set, onGoTo }: { s: AppState; set: (x: AppState) => void; o
   // ── Alertas de tareas atrasadas ────────────────────────────────────────────
   const overdue = overdueTasks(s.tasks, todayStr);
 
+  // ── Metas del Mes 🌙 y del Trimestre 📅 (Dashboard HOY) ───────────────────
+  // El avance se mide SOLO con comisiones 100% liquidadas 🟢.
+  const commissions = s.commissions ?? [];
+  const goalAdjustments = s.goalAdjustments ?? [];
+  const { toast, notify, dismiss } = useToast();
+  const [goalEditor, setGoalEditor] = useState<GoalTargetType | null>(null);
+  const monthlyProgress = getGoalProgressData(commissions, s.monthlyGoal.target, "monthly", todayStr);
+  const quarterlyProgress = getGoalProgressData(commissions, s.quarterlyGoal.target, "quarterly", todayStr);
+
+  const saveGoalTarget = (type: GoalTargetType, amount: number, note: string) => {
+    const current = type === "monthly" ? s.monthlyGoal.target : s.quarterlyGoal.target;
+    if (round2(amount) === round2(current)) {
+      notify("El monto no cambió: no se registró ningún reajuste.", "warn");
+      setGoalEditor(null);
+      return;
+    }
+    const out = applyGoalTarget({ monthlyGoal: s.monthlyGoal, quarterlyGoal: s.quarterlyGoal, goalAdjustments }, type, amount, todayStr, note);
+    set({ ...s, monthlyGoal: out.monthlyGoal, quarterlyGoal: out.quarterlyGoal, goalAdjustments: out.goalAdjustments });
+    setGoalEditor(null);
+    notify(type === "monthly" ? "🌙 Meta del mes actualizada." : "📅 Meta trimestral actualizada.");
+  };
+
+  // Celebración por transición: confeti CSS + aviso al pasar a meta alcanzada.
+  // Si la meta ya estaba cumplida al abrir la app, se muestra el aviso permanente
+  // dentro de la tarjeta (sin confeti ni toast) para no repetir la celebración.
+  const seenAchievedRef = useRef<Record<string, boolean>>({});
+  const [celebrating, setCelebrating] = useState<GoalTargetType | null>(null);
+  useEffect(() => {
+    const entries: [GoalTargetType, GoalProgress][] = [["monthly", monthlyProgress], ["quarterly", quarterlyProgress]];
+    const hits: GoalTargetType[] = [];
+    entries.forEach(([t, p]) => {
+      const key = `${t}:${p.period.key}`;
+      const wasAchieved = seenAchievedRef.current[key];
+      seenAchievedRef.current[key] = p.achieved;
+      if (wasAchieved === false && p.achieved) hits.push(t);
+    });
+    if (hits.length === 0) return;
+    setCelebrating(hits.includes("quarterly") ? "quarterly" : "monthly");
+    notify(hits.includes("quarterly") ? "🏆 ¡Meta trimestral alcanzada! Excelente cierre de trimestre." : "🎉 ¡Meta del mes alcanzada! Sigues sumando sobre el objetivo.");
+    const t = window.setTimeout(() => setCelebrating(null), 5200);
+    return () => window.clearTimeout(t);
+  }, [monthlyProgress.achieved, quarterlyProgress.achieved, monthlyProgress.period.key, quarterlyProgress.period.key]);
+
+
   // ── Resumen de avances recientes (últimos 7 días) ─────────────────────────
   const w7 = new Date(); w7.setDate(w7.getDate() - 7);
   const pad2 = (x: number) => String(x).padStart(2, "0");
@@ -1137,6 +1852,28 @@ function HoyTab({ s, set, onGoTo }: { s: AppState; set: (x: AppState) => void; o
         ) : (
           <p className="text-xs text-gray-400 mt-4">Aún no hay datos de progreso. Define tu primera <button onClick={() => onGoTo("metas")} className="text-[#c084fc] hover:underline font-medium">meta →</button>, un <button onClick={() => onGoTo("tareas")} className="text-[#c084fc] hover:underline font-medium">plan de tareas →</button> o revisa tus <button onClick={() => onGoTo("habitos")} className="text-[#c084fc] hover:underline font-medium">hábitos →</button>.</p>
         )}
+      </div>
+
+      {/* Metas del Mes 🌙 y Trimestral 📅 */}
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <GoalCard
+          progress={monthlyProgress}
+          title="Meta del Mes"
+          emoji="🌙"
+          currency={s.currency}
+          onEdit={() => setGoalEditor("monthly")}
+          onGoTo={() => onGoTo("metas")}
+          celebrate={celebrating === "monthly"}
+        />
+        <GoalCard
+          progress={quarterlyProgress}
+          title="Meta Trimestral"
+          emoji="📅"
+          currency={s.currency}
+          onEdit={() => setGoalEditor("quarterly")}
+          onGoTo={() => onGoTo("metas")}
+          celebrate={celebrating === "quarterly"}
+        />
       </div>
 
       {/* Próxima acción recomendada */}
@@ -1272,6 +2009,17 @@ function HoyTab({ s, set, onGoTo }: { s: AppState; set: (x: AppState) => void; o
           </div>
         )}
       </Card>
+      <Toast toast={toast} onClose={dismiss} />
+      {goalEditor && (
+        <GoalEditor
+          type={goalEditor}
+          currentTarget={goalEditor === "monthly" ? s.monthlyGoal.target : s.quarterlyGoal.target}
+          adjustments={goalAdjustments}
+          currency={s.currency}
+          onSave={(amount, note) => saveGoalTarget(goalEditor, amount, note)}
+          onClose={() => setGoalEditor(null)}
+        />
+      )}
     </div>
   );
 }
@@ -2778,6 +3526,7 @@ function MoneyTab({ s, set, hideAmounts, onToggleHide, onMutateIncomes, onMutate
 
 function CapitalTab({ s, set, hideAmounts, onToggleHide }: { s: AppState; set: (x: AppState) => void; hideAmounts: boolean; onToggleHide: () => void }) {
   const c = s.currency;
+  const { toast, notify, dismiss } = useToast();
   const [showForm, setShowForm] = useState(false);
   const [abonarId, setAbonarId] = useState<string | null>(null);
   const [abonarAmt, setAbonarAmt] = useState("");
@@ -2871,6 +3620,12 @@ function CapitalTab({ s, set, hideAmounts, onToggleHide }: { s: AppState; set: (
 
   return (
     <div className="space-y-5">
+      {/* Configuración de Metas ⚙️ (mes y trimestre, con bitácora de reajustes) */}
+      <GoalsConfigSection s={s} set={set} currency={c} notify={notify} hideAmounts={hideAmounts} onToggleHide={onToggleHide} />
+
+      {/* Comisiones y Abonos 💸 (solo las liquidadas suman a las metas) */}
+      <CommissionsSection s={s} set={set} currency={c} notify={notify} />
+
       {/* Fondos */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
         {funds.map(({ key, label, color }) => {
@@ -3045,6 +3800,7 @@ function CapitalTab({ s, set, hideAmounts, onToggleHide }: { s: AppState; set: (
           </div>
         </div>
       )}
+      <Toast toast={toast} onClose={dismiss} />
     </div>
   );
 }
@@ -3867,6 +4623,8 @@ const ENTITY_PERSISTENCE: { entity: AppEntityName; key: keyof AppState }[] = [
   { entity: "habitLogs", key: "habitLogs" },
   { entity: "miniVictories", key: "miniVictories" },
   { entity: "quarterHistory", key: "quarterHistory" },
+  { entity: "commissions", key: "commissions" },
+  { entity: "goalAdjustments", key: "goalAdjustments" },
 ];
 
 // ─── Pantalla de configuración pendiente (evita la pantalla negra) ───────────
