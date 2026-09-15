@@ -10,6 +10,9 @@
   > aplicación financiera de referencia. Goal Assistant 90 no duplica esa contabilidad como
   > módulos independientes; conserva su propio historial de metas y progreso sin crear una
   > segunda capa financiera.
+  >
+  > **Dirección de edición:** las metas del mes/trimestre se editan únicamente en **Metas**;
+  > el tab **Hoy** es un espejo de solo lectura de esas metas (muestra monto, avance y estado).
 
   ## Architecture
 

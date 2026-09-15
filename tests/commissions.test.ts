@@ -685,6 +685,31 @@ describe("Integración con la app (App.tsx y persistencia en la nube)", () => {
     expect(app).toContain("Meta Trimestral");
   });
 
+  it("Hoy es un espejo de Metas: las metas se editan en Metas, nunca al revés", () => {
+    const start = app.indexOf("function HoyTab(");
+    const end = app.indexOf("function HabitosTab(");
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const hoy = app.slice(start, end);
+    // Hoy NO escribe metas ni abre el editor de metas (solo las refleja).
+    expect(hoy).not.toMatch(/applyGoalTarget\(/);
+    expect(hoy).not.toContain("GoalEditor");
+    expect(hoy).not.toContain("saveGoalTarget");
+    expect(hoy).not.toContain("setGoalEditor");
+    // sus tarjetas de meta solo llevan a la pestaña Metas
+    expect(hoy).toContain('onManage={() => onGoTo("metas")}');
+    expect((hoy.match(/onManage=/g) || []).length).toBe(2);
+    // la tarjeta es de solo lectura y lo dice explícitamente
+    const card = app.slice(app.indexOf("function GoalCard("), app.indexOf("function GoalEditor("));
+    expect(card).toContain("Editar en Metas");
+    expect(card).not.toContain("onEdit");
+    // y Metas (CapitalTab) sigue siendo la única superficie de edición de metas
+    expect(app).toContain("Configuración de Metas");
+    expect(app).toMatch(/applyGoalTarget\(/);
+    const capital = app.slice(app.indexOf("function CapitalTab("));
+    expect(capital).toContain("GoalsConfigSection");
+  });
+
   it("la pestaña Metas incluye configuración de metas, comisiones y abonos", () => {
     expect(app).toContain("Configuración de Metas");
     expect(app).toContain("Comisiones y Abonos");

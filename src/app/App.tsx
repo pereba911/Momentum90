@@ -1153,10 +1153,11 @@ function MotivationalMessage({ progress, className = "" }: { progress: GoalProgr
   );
 }
 
-/** Tarjeta de meta del mes 🌙 o del trimestre 📅 (barra con color dinámico). */
-function GoalCard({ progress, title, emoji, currency, onEdit, onGoTo, celebrate }: {
+/** Tarjeta de meta del mes 🌙 o del trimestre 📅 (barra con color dinámico).
+ *  Espejo de solo lectura: las metas se editan en la pestaña Metas, nunca desde Hoy. */
+function GoalCard({ progress, title, emoji, currency, onManage, celebrate }: {
   progress: GoalProgress; title: string; emoji: string; currency: Currency;
-  onEdit: () => void; onGoTo: () => void; celebrate?: boolean;
+  onManage: () => void; celebrate?: boolean;
 }) {
   const { period, target, current, percentage, remaining, hasTarget, achieved, color, bandLabel, inProcessAmount, inProcessCount, pendingCount, settledCount } = progress;
   return (
@@ -1171,8 +1172,8 @@ function GoalCard({ progress, title, emoji, currency, onEdit, onGoTo, celebrate 
               <p className="text-[11px] text-gray-500">{period.label}</p>
             </div>
           </div>
-          <button onClick={onEdit} aria-label={`Editar ${title}`} title="Editar meta" className="shrink-0 w-11 h-11 inline-flex items-center justify-center rounded-xl text-gray-400 hover:text-white hover:bg-white/10 transition-all">
-            <Pencil size={15} />
+          <button onClick={onManage} aria-label={`Editar ${title} en Metas`} title="Los montos se editan en la pestaña Metas" className="shrink-0 min-h-11 px-2.5 inline-flex items-center gap-1.5 rounded-xl text-gray-400 hover:text-white hover:bg-white/10 transition-all">
+            <Pencil size={13} /><span className="text-[11px] font-medium">Editar en Metas</span>
           </button>
         </div>
 
@@ -1200,7 +1201,7 @@ function GoalCard({ progress, title, emoji, currency, onEdit, onGoTo, celebrate 
 
             <div className="mt-3 flex items-end justify-between gap-3">
               <MotivationalMessage progress={progress} className="flex-1" />
-              <button onClick={onGoTo} className="shrink-0 text-[11px] text-[#c084fc] hover:underline font-medium">Gestionar →</button>
+              <button onClick={onManage} className="shrink-0 text-[11px] text-[#c084fc] hover:underline font-medium">Gestionar en Metas →</button>
             </div>
 
             {achieved && (
@@ -1215,8 +1216,7 @@ function GoalCard({ progress, title, emoji, currency, onEdit, onGoTo, celebrate 
             <p className="text-[11px] text-gray-600 mt-1">Define el monto objetivo y el avance se medirá con tus comisiones liquidadas.</p>
             {inProcessAmount > 0 && <p className="text-[11px] text-amber-300/90 mt-2">🟡 {fmt(inProcessAmount, currency)} ya abonado, esperando una meta definida.</p>}
             <div className="mt-3 flex flex-wrap gap-2">
-              <button onClick={onEdit} className="min-h-11 px-4 rounded-xl bg-[#9D4EDD] text-white text-sm font-semibold hover:bg-[#7B2CBF]">Definir meta</button>
-              <button onClick={onGoTo} className="min-h-11 px-4 rounded-xl bg-white/5 text-gray-300 text-sm font-medium hover:bg-white/10">Ver comisiones</button>
+              <button onClick={onManage} className="min-h-11 px-4 rounded-xl bg-[#9D4EDD] text-white text-sm font-semibold hover:bg-[#7B2CBF]">Definir meta en Metas →</button>
             </div>
           </div>
         )}
@@ -1855,27 +1855,14 @@ function HoyTab({ s, set, onGoTo }: { s: AppState; set: (x: AppState) => void; o
   // ── Alertas de tareas atrasadas ────────────────────────────────────────────
   const overdue = overdueTasks(s.tasks, todayStr);
 
-  // ── Metas del Mes 🌙 y del Trimestre 📅 (Dashboard HOY) ───────────────────
+  // ── Metas del Mes 🌙 y del Trimestre 📅 (espejo de la pestaña Metas) ──────
   // El avance se mide SOLO con comisiones 100% liquidadas 🟢.
+  // Hoy es un ESPEJO: muestra el monto y el avance que se definen en Metas;
+  // aquí no se edita ninguna meta (la edición vive en Metas → Configuración).
   const commissions = s.commissions ?? [];
-  const goalAdjustments = s.goalAdjustments ?? [];
   const { toast, notify, dismiss } = useToast();
-  const [goalEditor, setGoalEditor] = useState<GoalTargetType | null>(null);
   const monthlyProgress = getGoalProgressData(commissions, s.monthlyGoal.target, "monthly", todayStr);
   const quarterlyProgress = getGoalProgressData(commissions, s.quarterlyGoal.target, "quarterly", todayStr);
-
-  const saveGoalTarget = (type: GoalTargetType, amount: number, note: string) => {
-    const current = type === "monthly" ? s.monthlyGoal.target : s.quarterlyGoal.target;
-    if (round2(amount) === round2(current)) {
-      notify("El monto no cambió: no se registró ningún reajuste.", "warn");
-      setGoalEditor(null);
-      return;
-    }
-    const out = applyGoalTarget({ monthlyGoal: s.monthlyGoal, quarterlyGoal: s.quarterlyGoal, goalAdjustments }, type, amount, todayStr, note);
-    set({ ...s, monthlyGoal: out.monthlyGoal, quarterlyGoal: out.quarterlyGoal, goalAdjustments: out.goalAdjustments });
-    setGoalEditor(null);
-    notify(type === "monthly" ? "🌙 Meta del mes actualizada." : "📅 Meta trimestral actualizada.");
-  };
 
   // Celebración por transición: confeti CSS + aviso al pasar a meta alcanzada.
   // Si la meta ya estaba cumplida al abrir la app, se muestra el aviso permanente
@@ -1936,15 +1923,14 @@ function HoyTab({ s, set, onGoTo }: { s: AppState; set: (x: AppState) => void; o
         )}
       </div>
 
-      {/* Metas del Mes 🌙 y Trimestral 📅 */}
+      {/* Metas del Mes 🌙 y Trimestral 📅 · espejo de solo lectura (se editan en Metas) */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
         <GoalCard
           progress={monthlyProgress}
           title="Meta del Mes"
           emoji="🌙"
           currency={s.currency}
-          onEdit={() => setGoalEditor("monthly")}
-          onGoTo={() => onGoTo("metas")}
+          onManage={() => onGoTo("metas")}
           celebrate={celebrating === "monthly"}
         />
         <GoalCard
@@ -1952,8 +1938,7 @@ function HoyTab({ s, set, onGoTo }: { s: AppState; set: (x: AppState) => void; o
           title="Meta Trimestral"
           emoji="📅"
           currency={s.currency}
-          onEdit={() => setGoalEditor("quarterly")}
-          onGoTo={() => onGoTo("metas")}
+          onManage={() => onGoTo("metas")}
           celebrate={celebrating === "quarterly"}
         />
       </div>
@@ -2092,16 +2077,6 @@ function HoyTab({ s, set, onGoTo }: { s: AppState; set: (x: AppState) => void; o
         )}
       </Card>
       <Toast toast={toast} onClose={dismiss} />
-      {goalEditor && (
-        <GoalEditor
-          type={goalEditor}
-          currentTarget={goalEditor === "monthly" ? s.monthlyGoal.target : s.quarterlyGoal.target}
-          adjustments={goalAdjustments}
-          currency={s.currency}
-          onSave={(amount, note) => saveGoalTarget(goalEditor, amount, note)}
-          onClose={() => setGoalEditor(null)}
-        />
-      )}
     </div>
   );
 }
