@@ -132,6 +132,18 @@ describe("Navegación: áreas principales de Goal Assistant 90", () => {
     expect(app).toContain('useState<AppTab>("hoy")');
   });
 
+  it("el tipo de áreas no conserva módulos financieros retirados", () => {
+    expect(app).toMatch(/type AppTab = "hoy" \| "metas" \| "plan" \| "habitos" \| "tareas" \| "logros" \| "oportunidades" \| "admin";/);
+    expect(app).not.toMatch(/"finanzas"/);
+    expect(app).not.toMatch(/"activos" \| "admin"/);
+  });
+
+  it("no hay navegación muerta hacia áreas retiradas", () => {
+    for (const dead of ["finanzas", "activos", "dashboard", "money", "capital", "crm"]) {
+      expect(app, `no debe navegarse a ${dead}`).not.toMatch(new RegExp(`(setTab|onGoTo)\\("${dead}"\\)`));
+    }
+  });
+
   it("la vista Hoy muestra fecha/ciclo, progreso, prioridades, hábitos, meta, próxima acción, atrasadas y avances", () => {
     for (const section of [
       "Próxima acción recomendada",

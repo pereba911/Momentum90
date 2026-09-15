@@ -36,10 +36,10 @@ type GoalStatus = "active" | "in-progress" | "completed";
 type GoalKind = "money" | "habit" | "task";
 type GoalCategory = "salud_y_cuerpo" | "carrera_y_trabajo" | "dinero" | "relaciones" | "deseos_personales";
 type TaskRecurringType = "none" | "daily" | "weekly" | "monthly" | "annual";
-// Goal Assistant 90 — áreas principales de la app.
-// Los datos financieros históricos de Momentum 90 no desaparecen: se conservan
-// íntegros y se accede a ellos desde el área secundaria "Registro financiero".
-type AppTab = "hoy" | "metas" | "plan" | "habitos" | "tareas" | "logros" | "oportunidades" | "finanzas" | "activos" | "admin";
+// Goal Assistant 90 — áreas principales: ejecución personal, sin duplicar la
+// contabilidad de Momentum 90 V2. Los módulos financieros históricos se retiraron de la
+// interfaz, pero sus datos siguen guardados en Supabase y nunca se borran.
+type AppTab = "hoy" | "metas" | "plan" | "habitos" | "tareas" | "logros" | "oportunidades" | "admin";
 type HabitCategory = "salud" | "negocio" | "enfoque";
 type ObjType = "monetary" | "task" | "habit" | "metric" | "relationship" | "other";
 type BusinessStatus = "idea" | "revision" | "por-publicar" | "marketing" | "ventas" | "negociacion" | "requerimiento" | "proceso";
@@ -5210,8 +5210,8 @@ export default function App() {
 
   // Goal Assistant 90 — áreas principales (la pantalla inicial es "Hoy").
   // Los módulos financieros históricos de Momentum 90 NO son áreas principales:
-  // se conservan bajo "Registro financiero · Momentum 90 (referencia)" para no
-  // duplicar contabilidad ni perder datos.
+  // se retiraron de la interfaz para no duplicar la contabilidad de la app de
+  // referencia, manteniendo sus datos intactos en Supabase.
   interface TabDef { id: AppTab; label: string; short: string; icon: ReactNode; badge?: number; group?: "main" | "fin"; }
 
   const MAIN_TABS: TabDef[] = [
